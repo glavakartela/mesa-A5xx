@@ -20,6 +20,7 @@
 
 #include "tu_cmd_buffer.h"
 #include "tu_image.h"
+#include "tu_sampler.h"
 #include "tu_shader.h"
 
 #include "ir3/ir3_shader.h"
@@ -285,8 +286,12 @@ tu5_emit_program(struct tu_cmd_buffer *cmd,
    s[0].instroff = 0;
    s[1].instroff = 64 - s[1].instrlen;
 
+   /* a5xx requires FOUR_QUADS when the FS uses half registers (for example
+    * an f16 texture sample); TWO_QUADS with half regs hangs the texture unit.
+    */
    enum a3xx_threadsize fssz =
-      s[1].info->double_threadsize ? FOUR_QUADS : TWO_QUADS;
+      (s[1].info->double_threadsize || s[1].info->max_half_reg >= 0) ?
+      FOUR_QUADS : TWO_QUADS;
 
    uint32_t pos_regid = ir3_find_output_regid(vs, VARYING_SLOT_POS);
    uint32_t psize_regid = ir3_find_output_regid(vs, VARYING_SLOT_PSIZ);
@@ -317,7 +322,12 @@ tu5_emit_program(struct tu_cmd_buffer *cmd,
       ir3_find_sysval_regid(fs, SYSTEM_VALUE_SAMPLE_MASK_IN);
    uint32_t face_regid = ir3_find_sysval_regid(fs, SYSTEM_VALUE_FRONT_FACE);
    uint32_t coord_regid = ir3_find_sysval_regid(fs, SYSTEM_VALUE_FRAG_COORD);
-   uint32_t zwcoord_regid = coord_regid + 2;
+   /* Keep the invalid regid for unused sysvals: 0 would mean r0 and the
+    * hardware would write several sysvals into the same register, clobbering
+    * the barycentric IJ values.
+    */
+   uint32_t zwcoord_regid = VALIDREG(coord_regid) ? coord_regid + 2
+                                                  : regid(63, 0);
    uint32_t ij_regid[IJ_COUNT];
    for (unsigned i = 0; i < ARRAY_SIZE(ij_regid); i++)
       ij_regid[i] = ir3_find_sysval_regid(
@@ -364,7 +374,8 @@ tu5_emit_program(struct tu_cmd_buffer *cmd,
    tu_cs_emit(cs, s[1].instrlen);
 
    tu5_emit_reg(cs, REG_A5XX_SP_VS_CTRL_REG0,
-      A5XX_SP_VS_CTRL_REG0_HALFREGFOOTPRINT(s[0].info->max_half_reg + 1) |
+      A5XX_SP_VS_CTRL_REG0_HALFREGFOOTPRINT(
+         MAX2(s[0].info->max_half_reg + 1, 1)) |
       A5XX_SP_VS_CTRL_REG0_FULLREGFOOTPRINT(s[0].info->max_reg + 1) |
       COND(s[0].instrlen != 0, A5XX_SP_VS_CTRL_REG0_BUFFER) |
       0x2 |
@@ -377,9 +388,21 @@ tu5_emit_program(struct tu_cmd_buffer *cmd,
    (void)pos_loc_final;
    (void)psize_loc_final;
 
+   /* fd5 computes this mask before appending POS/PSIZ to the linkage. */
+   uint32_t varmask[4] = {
+      linkage->varmask[0], linkage->varmask[1],
+      linkage->varmask[2], linkage->varmask[3],
+   };
+   if (pos_loc != 0xff) {
+      for (unsigned i = 0; i < 4; i++)
+         varmask[(pos_loc + i) / 32] &= ~(1u << ((pos_loc + i) % 32));
+   }
+   if (psize_loc != 0xff)
+      varmask[psize_loc / 32] &= ~(1u << (psize_loc % 32));
+
    tu_cs_emit_pkt4(cs, REG_A5XX_VPC_VAR_DISABLE(0), 4);
    for (unsigned i = 0; i < 4; i++)
-      tu_cs_emit(cs, ~linkage->varmask[i]);
+      tu_cs_emit(cs, ~varmask[i]);
 
    for (unsigned i = 0, j = 0; i < 16 && j < linkage->cnt; i++) {
       uint32_t reg = A5XX_SP_VS_OUT_REG_A_REGID(linkage->var[j].regid) |
@@ -422,30 +445,24 @@ tu5_emit_program(struct tu_cmd_buffer *cmd,
                   A5XX_HLSQ_CONTROL_0_REG_CSTHREADSIZE(TWO_QUADS) |
                   0x00000880);
    tu_cs_emit(cs, A5XX_HLSQ_CONTROL_1_REG_PRIMALLOCTHRESHOLD(63));
+   /* These HLSQ fields carry raw register ids, not booleans. Unused sysvals
+    * must be encoded as r63.x (0xfc), as fd5 does, not as 0 (= r0).
+    */
    tu_cs_emit(cs,
-      CONDREG(face_regid, A5XX_HLSQ_CONTROL_2_REG_FACEREGID(face_regid)) |
-      CONDREG(samp_id_regid, A5XX_HLSQ_CONTROL_2_REG_SAMPLEID(samp_id_regid)) |
-      CONDREG(samp_mask_regid,
-              A5XX_HLSQ_CONTROL_2_REG_SAMPLEMASK(samp_mask_regid)) |
-      CONDREG(ij_regid[IJ_PERSP_CENTER_RHW],
-              A5XX_HLSQ_CONTROL_2_REG_CENTERRHW(
-                 ij_regid[IJ_PERSP_CENTER_RHW])));
+      A5XX_HLSQ_CONTROL_2_REG_FACEREGID(face_regid) |
+      A5XX_HLSQ_CONTROL_2_REG_SAMPLEID(samp_id_regid) |
+      A5XX_HLSQ_CONTROL_2_REG_SAMPLEMASK(samp_mask_regid) |
+      A5XX_HLSQ_CONTROL_2_REG_CENTERRHW(ij_regid[IJ_PERSP_CENTER_RHW]));
    tu_cs_emit(cs,
-      CONDREG(ij_regid[IJ_PERSP_PIXEL],
-              A5XX_HLSQ_CONTROL_3_REG_IJ_PERSP_PIXEL(ij_regid[IJ_PERSP_PIXEL])) |
-      CONDREG(ij_regid[IJ_LINEAR_PIXEL],
-              A5XX_HLSQ_CONTROL_3_REG_IJ_LINEAR_PIXEL(ij_regid[IJ_LINEAR_PIXEL])) |
-      CONDREG(ij_regid[IJ_PERSP_CENTROID],
-              A5XX_HLSQ_CONTROL_3_REG_IJ_PERSP_CENTROID(ij_regid[IJ_PERSP_CENTROID])) |
-      CONDREG(ij_regid[IJ_LINEAR_CENTROID],
-              A5XX_HLSQ_CONTROL_3_REG_IJ_LINEAR_CENTROID(ij_regid[IJ_LINEAR_CENTROID])));
+      A5XX_HLSQ_CONTROL_3_REG_IJ_PERSP_PIXEL(ij_regid[IJ_PERSP_PIXEL]) |
+      A5XX_HLSQ_CONTROL_3_REG_IJ_LINEAR_PIXEL(ij_regid[IJ_LINEAR_PIXEL]) |
+      A5XX_HLSQ_CONTROL_3_REG_IJ_PERSP_CENTROID(ij_regid[IJ_PERSP_CENTROID]) |
+      A5XX_HLSQ_CONTROL_3_REG_IJ_LINEAR_CENTROID(ij_regid[IJ_LINEAR_CENTROID]));
    tu_cs_emit(cs,
-      CONDREG(coord_regid, A5XX_HLSQ_CONTROL_4_REG_XYCOORDREGID(coord_regid)) |
-      CONDREG(coord_regid, A5XX_HLSQ_CONTROL_4_REG_ZWCOORDREGID(zwcoord_regid)) |
-      CONDREG(ij_regid[IJ_PERSP_SAMPLE],
-              A5XX_HLSQ_CONTROL_4_REG_IJ_PERSP_SAMPLE(ij_regid[IJ_PERSP_SAMPLE])) |
-      CONDREG(ij_regid[IJ_LINEAR_SAMPLE],
-              A5XX_HLSQ_CONTROL_4_REG_IJ_LINEAR_SAMPLE(ij_regid[IJ_LINEAR_SAMPLE])));
+      A5XX_HLSQ_CONTROL_4_REG_XYCOORDREGID(coord_regid) |
+      A5XX_HLSQ_CONTROL_4_REG_ZWCOORDREGID(zwcoord_regid) |
+      A5XX_HLSQ_CONTROL_4_REG_IJ_PERSP_SAMPLE(ij_regid[IJ_PERSP_SAMPLE]) |
+      A5XX_HLSQ_CONTROL_4_REG_IJ_LINEAR_SAMPLE(ij_regid[IJ_LINEAR_SAMPLE]));
 
    tu5_emit_reg(cs, REG_A5XX_SP_FS_CTRL_REG0,
       COND(getenv("TU5_GFX_FORCE_VARYING") || fs->total_in > 0,
@@ -453,7 +470,8 @@ tu5_emit_program(struct tu_cmd_buffer *cmd,
       0x40002 |
       COND(s[1].instrlen != 0, A5XX_SP_FS_CTRL_REG0_BUFFER) |
       A5XX_SP_FS_CTRL_REG0_THREADSIZE(fssz) |
-      A5XX_SP_FS_CTRL_REG0_HALFREGFOOTPRINT(s[1].info->max_half_reg + 1) |
+      A5XX_SP_FS_CTRL_REG0_HALFREGFOOTPRINT(
+         MAX2(s[1].info->max_half_reg + 1, 1)) |
       A5XX_SP_FS_CTRL_REG0_FULLREGFOOTPRINT(s[1].info->max_reg + 1) |
       A5XX_SP_FS_CTRL_REG0_BRANCHSTACK(ir3_shader_branchstack_hw(fs)) |
       COND(fs->need_pixlod, A5XX_SP_FS_CTRL_REG0_PIXLODENABLE));
@@ -462,7 +480,8 @@ tu5_emit_program(struct tu_cmd_buffer *cmd,
       fprintf(stderr, "  iova vs=%" PRIx64 " fs=%" PRIx64 "\n",
               vs_shader->binary_iova, fs_shader->binary_iova);
       fprintf(stderr, "  vscntl=0x%x fsctrl=0x%x hlsq0=0x%x\n",
-         A5XX_SP_VS_CTRL_REG0_HALFREGFOOTPRINT(s[0].info->max_half_reg + 1) |
+         A5XX_SP_VS_CTRL_REG0_HALFREGFOOTPRINT(
+            MAX2(s[0].info->max_half_reg + 1, 1)) |
          A5XX_SP_VS_CTRL_REG0_FULLREGFOOTPRINT(s[0].info->max_reg + 1) |
          COND(s[0].instrlen != 0, A5XX_SP_VS_CTRL_REG0_BUFFER) | 0x2 |
          A5XX_SP_VS_CTRL_REG0_BRANCHSTACK(ir3_shader_branchstack_hw(vs)) |
@@ -470,7 +489,8 @@ tu5_emit_program(struct tu_cmd_buffer *cmd,
          COND(fs->total_in > 0, A5XX_SP_FS_CTRL_REG0_VARYING) | 0x40002 |
          COND(s[1].instrlen != 0, A5XX_SP_FS_CTRL_REG0_BUFFER) |
          A5XX_SP_FS_CTRL_REG0_THREADSIZE(fssz) |
-         A5XX_SP_FS_CTRL_REG0_HALFREGFOOTPRINT(s[1].info->max_half_reg + 1) |
+         A5XX_SP_FS_CTRL_REG0_HALFREGFOOTPRINT(
+            MAX2(s[1].info->max_half_reg + 1, 1)) |
          A5XX_SP_FS_CTRL_REG0_FULLREGFOOTPRINT(s[1].info->max_reg + 1) |
          A5XX_SP_FS_CTRL_REG0_BRANCHSTACK(ir3_shader_branchstack_hw(fs)) |
          COND(fs->need_pixlod, A5XX_SP_FS_CTRL_REG0_PIXLODENABLE),
@@ -901,6 +921,17 @@ tu5_emit_global_state(struct tu_cmd_buffer *cmd)
    tu5_emit_reg(cs, REG_A5XX_GRAS_SC_BIN_CNTL, 0);
    tu5_emit_reg(cs, REG_A5XX_GRAS_SU_CONSERVATIVE_RAS_CNTL, 0);
    tu5_emit_reg(cs, REG_A5XX_VPC_FS_PRIMITIVEID_CNTL, 0xff);
+
+   /* The kernel only programs the highest-bank-bit field; fd5 also sets the
+    * TPL1 mode flags. Texturing needs the full value.
+    */
+   uint32_t hbb = cmd->device->physical_device->info->highest_bank_bit;
+   if (hbb >= 13 && hbb <= 16) {
+      tu5_emit_reg(cs, REG_A5XX_TPL1_MODE_CNTL,
+                   0x444 | A5XX_TPL1_MODE_CNTL_HIGHESTBANKBIT(hbb - 13));
+      tu5_emit_reg(cs, REG_A5XX_RB_MODE_CNTL,
+                   0x40 | A5XX_RB_MODE_CNTL_HIGHESTBANKBIT(hbb - 13));
+   }
 }
 
 /* A5xx sysmem rendering has no GMEM, so RB_CLEAR_CNTL cannot be used to
@@ -1183,6 +1214,132 @@ tu5_emit_mrt(struct tu_cmd_buffer *cmd,
    }
 
    tu5_emit_reg(cs, REG_A5XX_RB_RENDER_COMPONENTS, components);
+}
+
+/* The A6xx MEMOBJ descriptor field layout overlaps A5xx TEX_CONST for the
+ * fields we need (format, swizzle, size, pitch, type, base, depth). The
+ * chip 5 images are linear, so force the tile mode. A5xx uses an explicit
+ * base register instead of a bindless descriptor vector.
+ */
+static void
+tu5_texture_descriptor(const uint32_t *src, uint32_t *dst)
+{
+   dst[0] = (src[0] & ~0x3u) | A5EN_TILE5_LINEAR;
+   dst[1] = src[1] & 0x3fffffffu;
+   dst[2] = src[2];
+   dst[3] = (src[3] & 0x3fffu) | (src[3] & 0x08000000u);
+   dst[4] = src[4] & ~0x1fu;
+   dst[5] = src[5] & 0x3fffffffu;
+   for (unsigned i = 6; i < 12; i++)
+      dst[i] = 0;
+}
+
+/* A5xx sampler words 0/1 match A6xx, word 2 only has BCOLOR_OFFSET instead
+ * of the A6xx border-color selectors. */
+static void
+tu5_sampler_descriptor(const uint32_t *src, uint32_t *dst)
+{
+   dst[0] = src[0];
+   dst[1] = src[1] & ~0x1u;
+   /* fd5 uses a small non-zero LOD clamp when mipmapping is off so the HW
+    * can still choose between min and mag filtering of level 0.
+    */
+   if (!(dst[1] & A5XX_TEX_SAMP_1_MAX_LOD__MASK))
+      dst[1] |= A5XX_TEX_SAMP_1_MAX_LOD(0.125f);
+   dst[2] = 0;
+   dst[3] = 0;
+}
+
+static void
+tu5_emit_textures(struct tu_cmd_buffer *cmd, struct tu_shader *shader,
+                  enum a4xx_state_block sb)
+{
+   if (!shader->num_textures && !shader->num_samplers)
+      return;
+
+   struct tu_descriptor_state *ds =
+      tu_get_descriptors_state(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+   uint32_t samplers[TU5_MAX_SAMPLERS][4] = {};
+   uint32_t textures[TU5_MAX_TEXTURES][12] = {};
+
+   for (unsigned i = 0; i < shader->num_samplers; i++) {
+      unsigned set = shader->samp_map[i].set;
+      unsigned binding = shader->samp_map[i].binding;
+      const struct tu_descriptor_set *dset =
+         set < MAX_SETS ? ds->sets[set] : NULL;
+
+      if (!dset || binding >= dset->layout->binding_count)
+         continue;
+
+      const struct tu_descriptor_set_binding_layout *bl =
+         &dset->layout->binding[binding];
+      const uint32_t *src = NULL;
+
+      if (bl->immutable_samplers_offset) {
+         const struct tu_sampler *immutable =
+            tu_immutable_samplers(dset->layout, bl);
+         if (immutable)
+            src = immutable->descriptor;
+      } else if (dset->mapped_ptr) {
+         if (bl->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+            src = dset->mapped_ptr + bl->offset / 4 + FDL6_TEX_CONST_DWORDS;
+         else if (bl->type == VK_DESCRIPTOR_TYPE_SAMPLER)
+            src = dset->mapped_ptr + bl->offset / 4;
+      }
+
+      if (src)
+         tu5_sampler_descriptor(src, samplers[i]);
+   }
+
+   for (unsigned i = 0; i < shader->num_textures; i++) {
+      unsigned set = shader->tex_map[i].set;
+      unsigned binding = shader->tex_map[i].binding;
+      const struct tu_descriptor_set *dset =
+         set < MAX_SETS ? ds->sets[set] : NULL;
+
+      if (!dset || binding >= dset->layout->binding_count ||
+          !dset->mapped_ptr)
+         continue;
+
+      const struct tu_descriptor_set_binding_layout *bl =
+         &dset->layout->binding[binding];
+      if (bl->type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
+          bl->type != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE &&
+          bl->type != VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT)
+         continue;
+
+      tu5_texture_descriptor(dset->mapped_ptr + bl->offset / 4, textures[i]);
+   }
+
+   struct tu_cs *cs = &cmd->cs;
+
+   if (shader->num_samplers) {
+      tu_cs_emit_pkt7(cs, CP_LOAD_STATE4, 3 + 4 * shader->num_samplers);
+      tu_cs_emit(cs, CP_LOAD_STATE4_0_DST_OFF(0) |
+                       CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
+                       CP_LOAD_STATE4_0_STATE_BLOCK(sb) |
+                       CP_LOAD_STATE4_0_NUM_UNIT(shader->num_samplers));
+      tu_cs_emit(cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_SHADER) |
+                       CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
+      tu_cs_emit(cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
+      for (unsigned i = 0; i < shader->num_samplers; i++)
+         for (unsigned j = 0; j < 4; j++)
+            tu_cs_emit(cs, samplers[i][j]);
+   }
+
+   if (shader->num_textures) {
+      tu_cs_emit_pkt7(cs, CP_LOAD_STATE4, 3 + 12 * shader->num_textures);
+      tu_cs_emit(cs, CP_LOAD_STATE4_0_DST_OFF(0) |
+                       CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
+                       CP_LOAD_STATE4_0_STATE_BLOCK(sb) |
+                       CP_LOAD_STATE4_0_NUM_UNIT(shader->num_textures));
+      tu_cs_emit(cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
+                       CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
+      tu_cs_emit(cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
+      for (unsigned i = 0; i < shader->num_textures; i++)
+         for (unsigned j = 0; j < 12; j++)
+            tu_cs_emit(cs, textures[i][j]);
+   }
 }
 
 static void
@@ -1733,6 +1890,11 @@ tu5_draw(struct tu_cmd_buffer *cmd, const struct tu5_draw_info *info)
               fs_dbg->instrlen, fs_dbg->constlen, fs_dbg->total_in,
               ir3_find_output_regid(fs_dbg, FRAG_RESULT_DATA0),
               ir3_find_output_regid(fs_dbg, FRAG_RESULT_COLOR));
+      for (unsigned k = 0; k < fs_dbg->inputs_count; k++)
+         fprintf(stderr, "    fs_in[%u]: slot=%u compmask=0x%x inloc=%u"
+                         " flat=%d bary=%d\n", k, fs_dbg->inputs[k].slot,
+                 fs_dbg->inputs[k].compmask, fs_dbg->inputs[k].inloc,
+                 fs_dbg->inputs[k].flat, fs_dbg->inputs[k].bary);
    }
 
    struct ir3_shader_linkage linkage = {};
@@ -1785,16 +1947,22 @@ tu5_draw(struct tu_cmd_buffer *cmd, const struct tu5_draw_info *info)
       tu5_emit_clear(cmd, 0xff0000ffu);
    tu5_emit_viewport(cmd, fb->width, fb->height);
    if (tu5_gfx_debug()) {
-      fprintf(stderr, "  link: cnt=%u max_loc=%u var0={regid=0x%x compmask=0x%x loc=%u} var1={regid=0x%x compmask=0x%x loc=%u} pos_loc=%u psize_loc=%u\n",
-              linkage.cnt, linkage.max_loc,
-              linkage.var[0].regid, linkage.var[0].compmask, linkage.var[0].loc,
-              linkage.var[1].regid, linkage.var[1].compmask, linkage.var[1].loc,
-              pos_loc, psize_loc);
+      fprintf(stderr, "  link: cnt=%u max_loc=%u pos_loc=%u psize_loc=%u varmask=%08x %08x\n",
+              linkage.cnt, linkage.max_loc, pos_loc, psize_loc,
+              linkage.varmask[0], linkage.varmask[1]);
+      for (unsigned k = 0; k < linkage.cnt; k++)
+         fprintf(stderr, "    var[%u]: slot=%u regid=0x%x compmask=0x%x loc=%u\n",
+                 k, linkage.var[k].slot, linkage.var[k].regid,
+                 linkage.var[k].compmask, linkage.var[k].loc);
    }
    tu5_emit_program(cmd, vs_shader, fs_shader, &linkage, pos_loc, psize_loc);
    tu5_emit_vs_driver_params(cmd, vs_shader, info);
    tu5_emit_gfx_ssbo_state(cmd, vs_shader, SB4_VS_SHADER);
    tu5_emit_gfx_ssbo_state(cmd, fs_shader, SB4_FS_SHADER);
+   tu5_emit_textures(cmd, vs_shader, SB4_VS_TEX);
+   tu5_emit_textures(cmd, fs_shader, SB4_FS_TEX);
+   tu5_emit_reg(cs, REG_A5XX_TPL1_VS_TEX_COUNT, vs_shader->num_textures);
+   tu5_emit_reg(cs, REG_A5XX_TPL1_FS_TEX_COUNT, fs_shader->num_textures);
    tu5_emit_rasterizer(cmd, vs_shader, fs_shader, linkage.max_loc);
    tu5_emit_vertex_inputs(cmd, vs_shader);
 

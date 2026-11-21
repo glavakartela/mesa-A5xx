@@ -64,6 +64,8 @@ struct tu_const_state
  */
 #define TU5_MAX_SSBOS 8
 #define TU5_MAX_UBOS 8
+#define TU5_MAX_TEXTURES 16
+#define TU5_MAX_SAMPLERS 16
 
 struct tu_shader
 {
@@ -96,6 +98,14 @@ struct tu_shader
    struct {
       uint8_t set, binding;
    } ubo_map[TU5_MAX_UBOS];
+   uint8_t num_textures;
+   struct {
+      uint8_t set, binding;
+   } tex_map[TU5_MAX_TEXTURES];
+   uint8_t num_samplers;
+   struct {
+      uint8_t set, binding;
+   } samp_map[TU5_MAX_SAMPLERS];
 
    /* The dynamic buffer descriptor size for descriptor sets that we know
     * about. This is used when linking to piece together the sizes and from

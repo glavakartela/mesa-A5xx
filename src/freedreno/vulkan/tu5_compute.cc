@@ -44,13 +44,13 @@ tu5_emit_cs_config(struct tu_cs *cs,
    const struct ir3_info *info = &v->info;
    enum tu5_threadsize thrsz =
       info->double_threadsize ? TU5_FOUR_QUADS : TU5_TWO_QUADS;
-   unsigned instrlen = v->instrlen;
-
-   /* If the shader is larger than 32*16 instructions, don't preload it.
-    * Mirrors the Gallium a5xx compute path.
+   /* Do not preload compute shaders into the shared internal instruction
+    * store: a preloaded graphics pipeline leaves its VS/FS there, and a
+    * subsequent preloaded compute dispatch was observed to read 0 instead
+    * of the SSBO values.  External fetch works reliably; keep it.
     */
-   if (instrlen > 32)
-      instrlen = 0;
+   unsigned instrlen = 0;
+   (void)v->instrlen;
 
    tu_cs_emit_pkt4(cs, TU5_REG_SP_SP_CNTL, 1);
    tu_cs_emit(cs, 0);

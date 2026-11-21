@@ -1071,12 +1071,98 @@ lower_tex_texel_buffer_to_image(
    }
 }
 
+/* a5xx has bindful textures: encode the Vulkan binding number directly as
+ * the TPL1 texture/sampler slot and drop the descriptor deref sources. The
+ * driver emits TPL1 state for those slots at draw time.
+ */
+/* a5xx's texture unit returns half-precision values.  A highp Vulkan
+ * shader would otherwise get a "sam (f32)" instruction, which is unreliable
+ * on this generation (observed as zero samples and GPU hangs).  Force the
+ * texture result to f16 and convert back to f32, matching what fd5 does for
+ * mediump shaders.
+ */
+static bool
+tu5_lower_tex_to_f16(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_tex)
+      return false;
+
+   nir_tex_instr *tex = nir_instr_as_tex(instr);
+   if (tex->dest_type != nir_type_float32)
+      return false;
+
+   tex->def.bit_size = 16;
+   tex->dest_type = nir_type_float16;
+
+   b->cursor = nir_after_instr(&tex->instr);
+   nir_def *cvt = nir_f2f32(b, &tex->def);
+   nir_def_rewrite_uses_after(&tex->def, cvt);
+   return true;
+}
+
+static bool
+tu5_lower_bindful_tex(nir_tex_instr *tex, struct tu_shader *shader, bool ref)
+{
+   int tex_idx = nir_tex_instr_src_index(
+      tex, ref ? nir_tex_src_texture_2_deref : nir_tex_src_texture_deref);
+   int samp_idx = nir_tex_instr_src_index(
+      tex, ref ? nir_tex_src_sampler_2_deref : nir_tex_src_sampler_deref);
+
+   if (tex_idx >= 0) {
+      nir_deref_instr *deref = nir_src_as_deref(tex->src[tex_idx].src);
+      nir_variable *var = nir_deref_instr_get_variable(deref);
+      if (!var || var->data.descriptor_set != 0 ||
+          var->data.binding >= TU5_MAX_TEXTURES)
+         return false;
+
+      unsigned binding = var->data.binding;
+      shader->tex_map[binding].set = var->data.descriptor_set;
+      shader->tex_map[binding].binding = binding;
+      shader->num_textures = MAX2(shader->num_textures, binding + 1);
+      tex->texture_index = binding;
+   }
+
+   if (samp_idx >= 0) {
+      nir_deref_instr *deref = nir_src_as_deref(tex->src[samp_idx].src);
+      nir_variable *var = nir_deref_instr_get_variable(deref);
+      if (!var || var->data.descriptor_set != 0 ||
+          var->data.binding >= TU5_MAX_SAMPLERS)
+         return false;
+
+      unsigned binding = var->data.binding;
+      shader->samp_map[binding].set = var->data.descriptor_set;
+      shader->samp_map[binding].binding = binding;
+      shader->num_samplers = MAX2(shader->num_samplers, binding + 1);
+      tex->sampler_index = binding;
+   }
+
+   /* Remove the deref sources, higher index first. */
+   if (tex_idx >= 0 && samp_idx >= 0) {
+      if (tex_idx > samp_idx) {
+         nir_tex_instr_remove_src(tex, tex_idx);
+         nir_tex_instr_remove_src(tex, samp_idx);
+      } else {
+         nir_tex_instr_remove_src(tex, samp_idx);
+         nir_tex_instr_remove_src(tex, tex_idx);
+      }
+   } else if (tex_idx >= 0) {
+      nir_tex_instr_remove_src(tex, tex_idx);
+   } else if (samp_idx >= 0) {
+      nir_tex_instr_remove_src(tex, samp_idx);
+   }
+
+   return true;
+}
+
 static bool
 lower_tex_impl(nir_builder *b, nir_tex_instr *tex, struct tu_device *dev,
           struct tu_shader *shader, const struct tu_pipeline_layout *layout,
           uint32_t read_only_input_attachments, bool dynamic_renderpass,
           bool ref)
 {
+   if (dev->physical_device->info->chip == 5)
+      return tu5_lower_bindful_tex(tex, shader, ref);
+
    bool descriptor_valid = true;
    int sampler_src_idx = nir_tex_instr_src_index(tex, ref ? nir_tex_src_sampler_2_deref : nir_tex_src_sampler_deref);
    if (sampler_src_idx >= 0) {
@@ -3958,6 +4044,11 @@ tu_shader_create(struct tu_device *dev,
             &const_allocs);
 
    if (dev->physical_device->info->chip == 5) {
+      NIR_PASS(_, nir, nir_shader_instructions_pass,
+               tu5_lower_tex_to_f16, nir_metadata_none, NULL);
+   }
+
+   if (dev->physical_device->info->chip == 5) {
       uint32_t size_base =
          const_allocs.consts[IR3_CONST_ALLOC_SSBO_SIZES].offset_vec4 * 4;
       NIR_PASS(_, nir, nir_shader_instructions_pass,
@@ -3974,6 +4065,14 @@ tu_shader_create(struct tu_device *dev,
    }
 
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+
+   if (dev->physical_device->info->chip == 5)
+      nir->info.num_textures = shader->num_textures;
+
+   if (dev->physical_device->info->chip == 5 && getenv("TU5_GFX_DEBUG")) {
+      fprintf(stderr, "tu5 final nir (stage %u):\n", nir->info.stage);
+      nir_print_shader(nir, stderr);
+   }
 
    struct ir3_shader_nir_options nir_options;
    init_ir3_nir_options(&nir_options, key);
@@ -4017,6 +4116,34 @@ tu_shader_create(struct tu_device *dev,
 
    shader->variant =
       ir3_shader_create_variant(ir3_shader, ir3_key, executable_info);
+
+   if (dev->physical_device->info->chip == 5 && getenv("TU5_DUMP_BIN") &&
+       shader->variant->bin) {
+      const struct ir3_shader_variant *v = shader->variant;
+      char name[64];
+      snprintf(name, sizeof(name), "/tmp/tu5_%u.bin", v->type);
+      FILE *f = fopen(name, "wb");
+      if (f) {
+         fwrite(v->bin, 4, v->info.sizedwords, f);
+         fclose(f);
+      }
+   }
+
+   if (dev->physical_device->info->chip == 5 && getenv("TU5_GFX_DEBUG")) {
+      const struct ir3_shader_variant *v = shader->variant;
+      fprintf(stderr, "tu5 shader stage=%u: inputs=%u outputs=%u total_in=%u"
+                      " constlen=%u instrlen=%u\n", v->type, v->inputs_count,
+              v->outputs_count, v->total_in, v->constlen, v->instrlen);
+      for (unsigned i = 0; i < v->inputs_count; i++)
+         fprintf(stderr, "  in[%u]: slot=%u sysval=%d compmask=0x%x"
+                         " inloc=%u flat=%d bary=%d regid=0x%x\n",
+                 i, v->inputs[i].slot, v->inputs[i].sysval,
+                 v->inputs[i].compmask, v->inputs[i].inloc,
+                 v->inputs[i].flat, v->inputs[i].bary, v->inputs[i].regid);
+      for (unsigned i = 0; i < v->outputs_count; i++)
+         fprintf(stderr, "  out[%u]: slot=%u regid=0x%x\n",
+                 i, v->outputs[i].slot, v->outputs[i].regid);
+   }
 
    if (ir3_exceeds_safe_constlen(shader->variant)) {
       struct ir3_shader_key safe_constlen_key = *ir3_key;
