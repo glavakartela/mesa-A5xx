@@ -6,8 +6,9 @@
 set -eu
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-BUILD=${BUILD:-/home/user/mesa-a5xx-work/build-a5xx}
-HOST=${1:-user@192.0.2.10}
+BUILD=${BUILD:-$HERE/../build-a5xx}
+HOST=${1:-${WHYRED_HOST:-}}
+[ -n "$HOST" ] || { echo "usage: $0 user@host" >&2; exit 2; }
 PORT=${PORT:-22}
 DEST=/tmp/tu5-test
 

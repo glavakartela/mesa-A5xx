@@ -60,15 +60,18 @@ Target: Xiaomi Redmi Note 5 / whyred, Adreno 509 (a5xx, sysmem path).
 
 ## Install / rollback
 
-Scripts: `a5xx/install-turnip-a5xx.sh`.
+Scripts: `a5xx/install-turnip-a5xx.sh`. The script never stores passwords:
+use an SSH key and passwordless sudo on the device (`sudo -n true` must
+succeed).
 
 ```sh
 # build the driver, then:
-bash a5xx/install-turnip-a5xx.sh <user@host> --ops
-bash a5xx/install-turnip-a5xx.sh <user@host> --rollback
+DRIVER=build-a5xx/src/freedreno/vulkan/libvulkan_freedreno.so \
+  ./a5xx/install-turnip-a5xx.sh user@host
+./a5xx/install-turnip-a5xx.sh user@host --rollback
 ```
 
-Backups are stored as `/home/user/turnip-a5xx-backup-*`.
+Backups are stored as `$HOME/turnip-a5xx-backup-*`.
 
 ## Known limitations / WIP
 
@@ -95,4 +98,4 @@ See `TESTING.md` and `TESTING.en.md`.
   contain `KWIN_DISABLE_VULKAN=1`. If the line is lost, KWin 6.8 picks our
   Turnip Vulkan: password/rotation artifacts, `Physical device Turnip ...
   doesn't support host query resets`, GPU fault `iova=0` and vblank timeout.
-  `install.sh` now rewrites the file with `printf`.
+  `install-turnip-a5xx.sh` now rewrites the file with `printf`.

@@ -5,7 +5,7 @@
 
 ```sh
 ./build.sh
-./run-on-device.sh user@192.0.2.10
+./run-on-device.sh user@host
 # PORT=22 по умолчанию, можно переопределить: PORT=24 ./run-on-device.sh ...
 ```
 

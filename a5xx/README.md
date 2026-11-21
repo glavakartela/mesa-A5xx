@@ -162,17 +162,20 @@ Plasma/KWin (разбор падения greeter'а):
 - после фикса greeter-KWin работает, login screen живой.
 
 Системная установка (боевой режим):
+- скрипт не хранит пароли: нужен SSH-ключ и passwordless sudo на
+  устройстве (`sudo -n true` должен проходить без ввода пароля);
 - ICD: `/usr/share/vulkan/icd.d/freedreno_icd.json` →
   `/usr/lib/turnip-a5xx/libvulkan_freedreno.so`;
-- ставится `bash install.sh user@192.0.2.10 --ops`
-  (stable — без аргумента, textures — `--texture`);
-- откат: `bash install.sh user@192.0.2.10 --rollback`;
-- бэкапы: `/home/user/turnip-a5xx-backup-*`;
+- ставится `DRIVER=build-a5xx/src/freedreno/vulkan/libvulkan_freedreno.so
+  ./a5xx/install-turnip-a5xx.sh user@host` (нужен SSH-ключ и
+  passwordless sudo; пароли скрипт не хранит);
+- откат: `./a5xx/install-turnip-a5xx.sh user@host --rollback`;
+- бэкапы: `$HOME/turnip-a5xx-backup-*`;
 - KWin: только `KWIN_DISABLE_VULKAN=1` (без `KWIN_COMPOSE=OpenGL`!)
   в `~/.config/environment.d/99-a5xx-kwin.conf` и
   `/var/lib/plasmalogin/.config/environment.d/99-a5xx-kwin.conf`;
-- **важно**: в `install.sh` был баг — `ACTION` сравнивался с `ops`, а
-  приходило `--ops`, поэтому `--ops/--texture/--rollback` не срабатывали
+- **важно**: публичная версия ставит один собранный `DRIVER`; режимы
+  `--ops/--texture` из старых заметок больше не нужны.
   и ставился stable. Исправлено (`ACTION="${ACTION#--}"`).
 
 Ограничения:
@@ -196,4 +199,4 @@ Plasma/KWin (разбор падения greeter'а):
   есть `KWIN_DISABLE_VULKAN=1`. Если строка потеряна, KWin 6.8 уходит на
   наш Turnip Vulkan: артефакты при вводе пароля/повороте, `Physical device
   Turnip ... doesn't support host query resets`, GPU fault `iova=0` и
-  vblank timeout. `install.sh` теперь перезаписывает файл через `printf`.
+  vblank timeout. `install-turnip-a5xx.sh` теперь перезаписывает файл через `printf`.

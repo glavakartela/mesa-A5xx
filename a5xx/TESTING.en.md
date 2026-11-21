@@ -60,11 +60,12 @@ Expected: LUNAR G cube with texture and depth, rc=0.
 ## Install / rollback
 
 ```sh
-bash a5xx/install-turnip-a5xx.sh <user@host> --ops
-bash a5xx/install-turnip-a5xx.sh <user@host> --rollback
+DRIVER=build-a5xx/src/freedreno/vulkan/libvulkan_freedreno.so \
+  ./a5xx/install-turnip-a5xx.sh user@host
+./a5xx/install-turnip-a5xx.sh user@host --rollback
 ```
 
-Backups: `/home/user/turnip-a5xx-backup-*`.
+Backups: `$HOME/turnip-a5xx-backup-*`.
 
 ## Known issues
 

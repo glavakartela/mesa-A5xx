@@ -8,7 +8,7 @@ English | [Русский](STABILITY.md)
 - Pre-stress smoke: 27/27 PASS except `tu5_texvb_test` (app-mapped WIP);
   `vkcube --c 60` rc=0.
 - Started a 20-minute `safe + tu5_texcopy_test + vkcube60` loop with a
-  disk log at `/home/user/stress-173537.log` (`sync` after every
+  disk log at `$HOME/stress-173537.log` (`sync` after every
   line).
 - After a few minutes the device disappeared from the network (`.73` dead;
   the LAN scan found only the old `.39`). Either a GPU hardlock or ath10k.

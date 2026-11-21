@@ -6,7 +6,7 @@ set -eu
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 CROSS=${CROSS:-aarch64-alarm-gcc}
-ROOTFS=${ROOTFS:-/home/user/rootfs}
+ROOTFS=${ROOTFS:-$HOME/rootfs}
 VK=${VK:-$ROOTFS/usr/lib/libvulkan.so.1.4.357}
 WAYLAND=${WAYLAND:-$ROOTFS/usr/lib/libwayland-client.so.0.26.0}
 

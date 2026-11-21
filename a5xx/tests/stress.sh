@@ -13,7 +13,7 @@ cd "$HERE"
 MODE=${MODE:-safe}
 DURATION=${DURATION:-1200}
 VKCUBE=${VKCUBE:-0}
-LOG=${LOG:-/home/user/stress-$(date +%H%M%S).log}
+LOG=${LOG:-$HOME/stress-$(date +%H%M%S).log}
 export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/1001}
 export WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-1}
 unset VK_ICD_FILENAMES VK_DRIVER_FILES TU5_GFX_NODEPTH

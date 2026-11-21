@@ -6,7 +6,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 BASE=$(cd "$HERE/.." && pwd)
 CROSS=${CROSS:-$BASE/cross/bin/aarch64-alarm-gcc}
 SYSROOT=${SYSROOT:-$BASE/sysroot}
-ROOTFS=${ROOTFS:-/home/user/rootfs}
+ROOTFS=${ROOTFS:-$HOME/rootfs}
 
 if [ ! -f "$HERE/ssbo_spv.h" ]; then
    glslc -fshader-stage=comp --target-env=vulkan1.0 -mfmt=c \

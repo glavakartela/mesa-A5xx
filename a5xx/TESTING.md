@@ -62,11 +62,12 @@ WAYLAND_DISPLAY=wayland-1 XDG_RUNTIME_DIR=/run/user/1001 \
 
 ```sh
 # stable / ops / rollback
-bash a5xx/install-turnip-a5xx.sh <user@host> --ops
-bash a5xx/install-turnip-a5xx.sh <user@host> --rollback
+DRIVER=build-a5xx/src/freedreno/vulkan/libvulkan_freedreno.so \
+  ./a5xx/install-turnip-a5xx.sh user@host
+./a5xx/install-turnip-a5xx.sh user@host --rollback
 ```
 
-Бэкапы: `/home/user/turnip-a5xx-backup-*`.
+Бэкапы: `$HOME/turnip-a5xx-backup-*`.
 
 ## Ограничения/известные баги
 

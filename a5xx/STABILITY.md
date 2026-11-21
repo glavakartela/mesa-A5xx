@@ -8,7 +8,7 @@ English: [STABILITY.en.md](STABILITY.en.md)
 - Smoke до стресса: 27/27 PASS, кроме `tu5_texvb_test` (app-mapped WIP);
   `vkcube --c 60` rc=0.
 - Запущен цикл `safe + tu5_texcopy_test + vkcube60` на 20 минут с логом
-  `/home/user/stress-173537.log` (на устройстве, `sync` после
+  `$HOME/stress-173537.log` (на устройстве, `sync` после
   каждой строки).
 - Примерно через несколько минут устройство пропало с сети (`.73` dead,
   в скане только старый `.39`). Это либо GPU hardlock, либо ath10k/Wi-Fi.

@@ -9,7 +9,7 @@ set -u
 cd "$(dirname "$0")"
 ITER=${ITER:-50}
 BIGCLEAR=${BIGCLEAR:-0}
-LOG=${LOG:-/home/user/texcopy-stress-$(date +%H%M%S).log}
+LOG=${LOG:-$HOME/texcopy-stress-$(date +%H%M%S).log}
 : > "$LOG"
 
 mark() { echo "$(date +%H:%M:%S) $*" | tee -a "$LOG"; sync; }

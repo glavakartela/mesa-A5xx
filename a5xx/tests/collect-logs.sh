@@ -3,7 +3,7 @@
 # Needs root (sudo) for dmesg/journal.
 set -u
 
-OUT=${OUT:-/home/user/a5xx-logs-$(date +%Y%m%d-%H%M%S)}
+OUT=${OUT:-$HOME/a5xx-logs-$(date +%Y%m%d-%H%M%S)}
 mkdir -p "$OUT"
 
 {
