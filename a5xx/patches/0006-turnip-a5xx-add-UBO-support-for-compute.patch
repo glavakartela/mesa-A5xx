@@ -1,0 +1,204 @@
+From 766059fee6f4d5b791c732720d38eaf026a48090 Mon Sep 17 00:00:00 2001
+From: local <local@local>
+Date: Thu, 19 Nov 2026 22:20:34 +0200
+Subject: [PATCH 06/29] turnip/a5xx: add UBO support for compute
+
+Lower uniform buffer descriptors to bindful slots, let ir3's pre-a6xx UBO
+analysis choose pointer or const-range uploads, and emit both at dispatch:
+- 64-bit UBO pointers into IR3_CONST_ALLOC_UBO_PTRS;
+- used subranges via CP_LOAD_STATE4 indirect from the UBO BO.
+
+Not yet hardware-tested; the device was unavailable when this was written.
+---
+ src/freedreno/vulkan/tu5_compute.cc | 86 +++++++++++++++++++++++++++++
+ src/freedreno/vulkan/tu_shader.cc   | 22 +++++++-
+ src/freedreno/vulkan/tu_shader.h    |  7 ++-
+ 3 files changed, 113 insertions(+), 2 deletions(-)
+
+diff --git a/src/freedreno/vulkan/tu5_compute.cc b/src/freedreno/vulkan/tu5_compute.cc
+index ecc6bcb..cd6ca68 100644
+--- a/src/freedreno/vulkan/tu5_compute.cc
++++ b/src/freedreno/vulkan/tu5_compute.cc
+@@ -306,6 +306,91 @@ tu5_emit_push_consts(struct tu_cmd_buffer *cmd,
+                  i < pc->dwords ? cmd->push_constants[i] : 0);
+ }
+ 
++static uint64_t
++tu5_get_ubo_addr(struct tu_cmd_buffer *cmd, unsigned binding)
++{
++   struct tu_descriptor_state *ds =
++      tu_get_descriptors_state(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
++   struct tu_descriptor_set *dset = ds->sets[0];
++
++   if (!dset || binding >= dset->layout->binding_count || !dset->mapped_ptr)
++      return 0;
++
++   const struct tu_descriptor_set_binding_layout *bl =
++      &dset->layout->binding[binding];
++   if (bl->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
++      return 0;
++
++   const uint32_t *desc = dset->mapped_ptr + bl->offset / 4;
++   return desc[0] | ((uint64_t)(desc[1] & 0x1ffff) << 32);
++}
++
++static void
++tu5_emit_ubo_state(struct tu_cmd_buffer *cmd)
++{
++   struct tu_shader *shader = cmd->state.shaders[MESA_SHADER_COMPUTE];
++   const struct ir3_shader_variant *v = shader->variant;
++
++   if (!shader->num_ubos)
++      return;
++
++   const struct ir3_const_allocations *allocs = &v->const_state->allocs;
++
++   /* Full UBO loads go through pointers in const state (gen < 6). */
++   if (ir3_const_can_upload(allocs, IR3_CONST_ALLOC_UBO_PTRS, v->constlen)) {
++      uint32_t off = allocs->consts[IR3_CONST_ALLOC_UBO_PTRS].offset_vec4;
++      unsigned slots = MAX2((unsigned)shader->num_ubos, v->const_state->num_ubos);
++      unsigned units = DIV_ROUND_UP(slots * 2, 4);
++
++      tu_cs_emit_pkt7(&cmd->cs, CP_LOAD_STATE4, 3 + units * 4);
++      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_0_DST_OFF(off) |
++                               CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
++                               CP_LOAD_STATE4_0_STATE_BLOCK(SB4_CS_SHADER) |
++                               CP_LOAD_STATE4_0_NUM_UNIT(units));
++      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
++                               CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
++      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
++
++      for (unsigned i = 0; i < units * 4; i++) {
++         unsigned slot = i / 2;
++         unsigned addr_lo = 0, addr_hi = 0;
++         if (slot < shader->num_ubos) {
++            uint64_t addr = tu5_get_ubo_addr(cmd, shader->ubo_map[slot].binding);
++            addr_lo = addr;
++            addr_hi = addr >> 32;
++         }
++         tu_cs_emit(&cmd->cs, (i & 1) ? addr_hi : addr_lo);
++      }
++   }
++
++   /* Static subranges are pushed directly into const state. */
++   const struct ir3_ubo_analysis_state *state = &v->const_state->ubo_state;
++   for (unsigned i = 0; i < state->num_enabled; i++) {
++      const struct ir3_ubo_range *r = &state->range[i];
++      uint32_t size = r->end - r->start;
++      if (!size || !ir3_const_can_upload(allocs, IR3_CONST_ALLOC_UBO_RANGES,
++                                         v->constlen))
++         continue;
++
++      uint64_t addr = tu5_get_ubo_addr(cmd, r->ubo.block);
++      if (!addr)
++         continue;
++
++      unsigned units = size / 16;
++      if (!units)
++         continue;
++
++      tu_cs_emit_pkt7(&cmd->cs, CP_LOAD_STATE4, 3);
++      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_0_DST_OFF(r->offset / 16) |
++                               CP_LOAD_STATE4_0_STATE_SRC(SS4_INDIRECT) |
++                               CP_LOAD_STATE4_0_STATE_BLOCK(SB4_CS_SHADER) |
++                               CP_LOAD_STATE4_0_NUM_UNIT(units));
++      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
++                               CP_LOAD_STATE4_1_EXT_SRC_ADDR((uint32_t)(addr + r->start)));
++      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI((addr + r->start) >> 32));
++   }
++}
++
+ void
+ tu5_dispatch(struct tu_cmd_buffer *cmd, const struct tu_dispatch_info *info)
+ {
+@@ -323,6 +408,7 @@ tu5_dispatch(struct tu_cmd_buffer *cmd, const struct tu_dispatch_info *info)
+    tu5_emit_driver_params(cmd, v, info);
+    tu5_emit_push_consts(cmd, v);
+    tu5_emit_ssbo_state(cmd);
++   tu5_emit_ubo_state(cmd);
+ 
+    const uint16_t *local_size = v->local_size;
+    const uint32_t *num_groups = info->blocks;
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index 6091e38..67cefe9 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -233,7 +233,10 @@ tu_spirv_to_nir(struct tu_device *dev,
+       uint32_t max_ssbo = 0;
+       nir_foreach_variable_with_modes (var, nir, nir_var_mem_ssbo)
+          max_ssbo = MAX2(max_ssbo, var->data.binding + 1);
+-      nir->info.num_ubos = 0;
++      uint32_t max_ubo = 0;
++      nir_foreach_variable_with_modes (var, nir, nir_var_mem_ubo)
++         max_ubo = MAX2(max_ubo, var->data.binding + 1);
++      nir->info.num_ubos = max_ubo;
+       nir->info.num_ssbos = max_ssbo;
+    } else {
+       nir->info.num_ubos = 0;
+@@ -1572,6 +1575,7 @@ tu5_lower_bindful_ssbo_instr(nir_builder *b, nir_instr *instr, void *data)
+    unsigned desc_src;
+ 
+    switch (intrin->intrinsic) {
++   case nir_intrinsic_load_ubo:
+    case nir_intrinsic_load_ssbo:
+    case nir_intrinsic_ssbo_atomic:
+    case nir_intrinsic_ssbo_atomic_swap:
+@@ -3582,6 +3586,8 @@ tu_shader_cache_process_blob(IO &io, struct tu_shader *shader)
+    io.u8(shader->active_desc_sets);
+    io.u8(shader->num_ssbos);
+    io.bytes(shader->ssbo_map, sizeof(shader->ssbo_map));
++   io.u8(shader->num_ubos);
++   io.bytes(shader->ubo_map, sizeof(shader->ubo_map));
+    io.boolean(shader->per_layer_viewport);
+ 
+    io.variant(shader->variant);
+@@ -3884,6 +3890,20 @@ tu_shader_create(struct tu_device *dev,
+          nir->info.num_ssbos = max_binding + 1;
+    }
+ 
++   if (dev->physical_device->info->chip == 5) {
++      nir_foreach_variable_with_modes (var, nir, nir_var_mem_ubo) {
++         if (var->data.descriptor_set != 0 ||
++             var->data.binding >= TU5_MAX_UBOS ||
++             shader->num_ubos >= TU5_MAX_UBOS) {
++            vk_free(&dev->vk.alloc, shader);
++            return VK_ERROR_FEATURE_NOT_PRESENT;
++         }
++         shader->ubo_map[shader->num_ubos].set = var->data.descriptor_set;
++         shader->ubo_map[shader->num_ubos].binding = var->data.binding;
++         shader->num_ubos++;
++      }
++   }
++
+    if (dev->physical_device->info->chip == 5) {
+       /* a5xx isam/ldgb take an immediate SSBO state slot; replace the bindless
+        * descriptor vector with that slot before descriptor lowering runs.
+diff --git a/src/freedreno/vulkan/tu_shader.h b/src/freedreno/vulkan/tu_shader.h
+index 2f815ce..9b6552f 100644
+--- a/src/freedreno/vulkan/tu_shader.h
++++ b/src/freedreno/vulkan/tu_shader.h
+@@ -63,6 +63,7 @@ struct tu_const_state
+  * number, so only set 0 is supported by the current MVP.
+  */
+ #define TU5_MAX_SSBOS 8
++#define TU5_MAX_UBOS 8
+ 
+ struct tu_shader
+ {
+@@ -84,11 +85,15 @@ struct tu_shader
+    uint32_t view_mask;
+    uint8_t active_desc_sets;
+ 
+-   /* a5xx only: bindful SSBO slots recorded at shader creation. */
++   /* a5xx only: bindful SSBO/UBO slots recorded at shader creation. */
+    uint8_t num_ssbos;
+    struct {
+       uint8_t set, binding;
+    } ssbo_map[TU5_MAX_SSBOS];
++   uint8_t num_ubos;
++   struct {
++      uint8_t set, binding;
++   } ubo_map[TU5_MAX_UBOS];
+ 
+    /* The dynamic buffer descriptor size for descriptor sets that we know
+     * about. This is used when linking to piece together the sizes and from

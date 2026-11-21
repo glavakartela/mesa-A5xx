@@ -1,0 +1,224 @@
+From 08e28cf2eb8ff2fdb02003b8a561e72d0a8e485e Mon Sep 17 00:00:00 2001
+From: opencode <user@example.com>
+Date: Fri, 20 Nov 2026 12:18:54 +0200
+Subject: [PATCH 19/29] turnip/a5xx: support multiple render targets
+
+Collect the subpass color attachments into an array, emit RB_MRT_BUF_INFO/
+PITCH/ARRAY_PITCH/BASE and SP_FS_MRT_REG for every used MRT, set the
+corresponding RB_RENDER_COMPONENTS fields and pass the attachment count
+to RB_FS_OUTPUT_CNTL_MRT/SP_FS_OUTPUT_CNTL_MRT. Per-attachment MRT and
+blend control state is emitted for each RT as well.
+
+The FS output register ids for DATA0..DATA7 were already computed and
+written to SP_FS_OUTPUT_REG, so a shader with two color outputs now
+lands in the right attachment.
+
+tu5_mrt_test: one FS writes red to location 0 and green to location 1;
+both 64x64 attachments read back correct (4096/4096), PASS. Triangle and
+depth tests still PASS.
+---
+ src/freedreno/vulkan/tu5_graphics.cc | 127 +++++++++++++++------------
+ 1 file changed, 72 insertions(+), 55 deletions(-)
+
+diff --git a/src/freedreno/vulkan/tu5_graphics.cc b/src/freedreno/vulkan/tu5_graphics.cc
+index de68077..2aa198b 100644
+--- a/src/freedreno/vulkan/tu5_graphics.cc
++++ b/src/freedreno/vulkan/tu5_graphics.cc
+@@ -1135,21 +1135,30 @@ tu5_clear_attachments(struct tu_cmd_buffer *cmd)
+ 
+ static void
+ tu5_emit_mrt(struct tu_cmd_buffer *cmd,
+-             const struct tu_image_view *iview,
+-             uint32_t width, uint32_t height)
++             const struct tu_image_view *iviews[8], unsigned nr)
+ {
+    struct tu_cs *cs = &cmd->cs;
+-   VkFormat vk_format = iview->vk.format;
+-   bool srgb, sint, uint_format;
+-   uint32_t format =
+-      tu5_format(vk_format, &srgb, &sint, &uint_format);
+-   enum a3xx_color_swap swap = tu5_format_swap(vk_format);
+-   uint32_t pitch = iview->view.pitch;
+-   uint32_t layer_size = iview->view.layer_size;
+-   uint64_t base = iview->view.base_addr;
++   uint32_t components = 0;
+ 
+    for (unsigned i = 0; i < 8; i++) {
+-      bool used = i == 0;
++      const struct tu_image_view *iview = i < nr ? iviews[i] : NULL;
++      bool used = iview != NULL;
++      bool srgb = false, sint = false, uint_format = false;
++      uint32_t format = 0;
++      enum a3xx_color_swap swap = WZYX;
++      uint32_t pitch = 0, layer_size = 0;
++      uint64_t base = 0;
++
++      if (used) {
++         VkFormat vk_format = iview->vk.format;
++         format = tu5_format(vk_format, &srgb, &sint, &uint_format);
++         swap = tu5_format_swap(vk_format);
++         pitch = iview->view.pitch;
++         layer_size = iview->view.layer_size;
++         base = iview->view.base_addr;
++         components |= 0xf << (4 * i);
++      }
++
+       tu_cs_emit_pkt4(cs, REG_A5XX_RB_MRT_BUF_INFO(i), 5);
+       tu_cs_emit(cs,
+          A5XX_RB_MRT_BUF_INFO_COLOR_FORMAT(used ? format : 0) |
+@@ -1158,12 +1167,7 @@ tu5_emit_mrt(struct tu_cmd_buffer *cmd,
+          COND(used && srgb, A5XX_RB_MRT_BUF_INFO_COLOR_SRGB));
+       tu_cs_emit(cs, A5XX_RB_MRT_PITCH(used ? pitch : 0));
+       tu_cs_emit(cs, A5XX_RB_MRT_ARRAY_PITCH(used ? layer_size : 0));
+-      if (used) {
+-         tu_cs_emit_qw(cs, base);
+-      } else {
+-         tu_cs_emit(cs, 0);
+-         tu_cs_emit(cs, 0);
+-      }
++      tu_cs_emit_qw(cs, base);
+ 
+       tu5_emit_reg(cs, REG_A5XX_SP_FS_MRT_REG(i),
+          A5XX_SP_FS_MRT_REG_COLOR_FORMAT(used ? format : 0) |
+@@ -1178,8 +1182,7 @@ tu5_emit_mrt(struct tu_cmd_buffer *cmd,
+       tu_cs_emit(cs, A5XX_RB_MRT_FLAG_BUFFER_ARRAY_PITCH(0));
+    }
+ 
+-   (void)width;
+-   (void)height;
++   tu5_emit_reg(cs, REG_A5XX_RB_RENDER_COMPONENTS, components);
+ }
+ 
+ static void
+@@ -1572,13 +1575,14 @@ tu5_emit_rasterizer(struct tu_cmd_buffer *cmd,
+    tu5_emit_reg(cs, REG_A5XX_RB_ALPHA_CONTROL, 0);
+    tu5_emit_zs(cmd, fs);
+ 
+-   uint32_t nr = 1;
+    uint32_t posz_regid = ir3_find_output_regid(fs, FRAG_RESULT_DEPTH);
+    uint32_t smask_regid = ir3_find_output_regid(fs, FRAG_RESULT_SAMPLE_MASK);
+    bool writes_smask = fs->writes_smask;
+    if (!writes_smask)
+       smask_regid = regid(63, 0);
+ 
++   unsigned nr = MIN2(cmd->state.subpass->color_count, 8u);
++
+    tu5_emit_reg(cs, REG_A5XX_RB_FS_OUTPUT_CNTL,
+       A5XX_RB_FS_OUTPUT_CNTL_MRT(nr) |
+       COND(fs->writes_pos, A5XX_RB_FS_OUTPUT_CNTL_FRAG_WRITES_Z) |
+@@ -1588,42 +1592,40 @@ tu5_emit_rasterizer(struct tu_cmd_buffer *cmd,
+       A5XX_SP_FS_OUTPUT_CNTL_DEPTH_REGID(posz_regid) |
+       A5XX_SP_FS_OUTPUT_CNTL_SAMPLEMASK_REGID(smask_regid));
+ 
+-   tu5_emit_reg(cs, REG_A5XX_RB_RENDER_COMPONENTS,
+-      A5XX_RB_RENDER_COMPONENTS_RT0(0xf));
+ 
+-   const struct vk_color_blend_attachment_state *cba =
+-      &dyn->cb.attachments[0];
+-   bool blend_enable = cba->blend_enable;
+-   uint32_t mrt_control =
+-      A5XX_RB_MRT_CONTROL_ROP_CODE(ROP_COPY) |
+-      A5XX_RB_MRT_CONTROL_COMPONENT_ENABLE(cba->write_mask);
+-   uint32_t blend_control = 0;
++
+    uint32_t blend_mask = 0;
+ 
+-   if (blend_enable) {
+-      blend_control =
+-         A5XX_RB_MRT_BLEND_CONTROL_RGB_SRC_FACTOR(
+-            tu5_blend_factor((VkBlendFactor)cba->src_color_blend_factor)) |
+-         A5XX_RB_MRT_BLEND_CONTROL_RGB_BLEND_OPCODE(
+-            tu5_blend_op(cba->color_blend_op)) |
+-         A5XX_RB_MRT_BLEND_CONTROL_RGB_DEST_FACTOR(
+-            tu5_blend_factor((VkBlendFactor)cba->dst_color_blend_factor)) |
+-         A5XX_RB_MRT_BLEND_CONTROL_ALPHA_SRC_FACTOR(
+-            tu5_blend_factor((VkBlendFactor)cba->src_alpha_blend_factor)) |
+-         A5XX_RB_MRT_BLEND_CONTROL_ALPHA_BLEND_OPCODE(
+-            tu5_blend_op(cba->alpha_blend_op)) |
+-         A5XX_RB_MRT_BLEND_CONTROL_ALPHA_DEST_FACTOR(
+-            tu5_blend_factor((VkBlendFactor)cba->dst_alpha_blend_factor));
+-      mrt_control |= A5XX_RB_MRT_CONTROL_BLEND |
+-                     A5XX_RB_MRT_CONTROL_BLEND2;
+-      blend_mask = 1;
+-   }
++   for (unsigned i = 0; i < 8; i++) {
++      const struct vk_color_blend_attachment_state *cba =
++         &dyn->cb.attachments[i];
++      bool used = i < nr;
++      uint32_t mrt_control = used ?
++         A5XX_RB_MRT_CONTROL_ROP_CODE(ROP_COPY) |
++         A5XX_RB_MRT_CONTROL_COMPONENT_ENABLE(cba->write_mask) : 0;
++      uint32_t blend_control = 0;
++
++      if (used && cba->blend_enable) {
++         blend_control =
++            A5XX_RB_MRT_BLEND_CONTROL_RGB_SRC_FACTOR(
++               tu5_blend_factor((VkBlendFactor)cba->src_color_blend_factor)) |
++            A5XX_RB_MRT_BLEND_CONTROL_RGB_BLEND_OPCODE(
++               tu5_blend_op(cba->color_blend_op)) |
++            A5XX_RB_MRT_BLEND_CONTROL_RGB_DEST_FACTOR(
++               tu5_blend_factor((VkBlendFactor)cba->dst_color_blend_factor)) |
++            A5XX_RB_MRT_BLEND_CONTROL_ALPHA_SRC_FACTOR(
++               tu5_blend_factor((VkBlendFactor)cba->src_alpha_blend_factor)) |
++            A5XX_RB_MRT_BLEND_CONTROL_ALPHA_BLEND_OPCODE(
++               tu5_blend_op(cba->alpha_blend_op)) |
++            A5XX_RB_MRT_BLEND_CONTROL_ALPHA_DEST_FACTOR(
++               tu5_blend_factor((VkBlendFactor)cba->dst_alpha_blend_factor));
++         mrt_control |= A5XX_RB_MRT_CONTROL_BLEND |
++                        A5XX_RB_MRT_CONTROL_BLEND2;
++         blend_mask |= 1u << i;
++      }
+ 
+-   tu5_emit_reg(cs, REG_A5XX_RB_MRT_CONTROL(0), mrt_control);
+-   tu5_emit_reg(cs, REG_A5XX_RB_MRT_BLEND_CONTROL(0), blend_control);
+-   for (unsigned i = 1; i < 8; i++) {
+-      tu5_emit_reg(cs, REG_A5XX_RB_MRT_CONTROL(i), 0);
+-      tu5_emit_reg(cs, REG_A5XX_RB_MRT_BLEND_CONTROL(i), 0);
++      tu5_emit_reg(cs, REG_A5XX_RB_MRT_CONTROL(i), mrt_control);
++      tu5_emit_reg(cs, REG_A5XX_RB_MRT_BLEND_CONTROL(i), blend_control);
+    }
+ 
+    /* A zero sample mask means no covered samples, so the FS would never be
+@@ -1634,7 +1636,7 @@ tu5_emit_rasterizer(struct tu_cmd_buffer *cmd,
+       sample_mask = 0xffff;
+    tu5_emit_reg(cs, REG_A5XX_SP_BLEND_CNTL,
+                 A5XX_SP_BLEND_CNTL_ENABLE_BLEND(blend_mask) |
+-                COND(blend_enable, A5XX_SP_BLEND_CNTL_UNK8));
++                COND(blend_mask != 0, A5XX_SP_BLEND_CNTL_UNK8));
+    tu5_emit_reg(cs, REG_A5XX_RB_BLEND_CNTL,
+                 A5XX_RB_BLEND_CNTL_ENABLE_BLEND(blend_mask) |
+                 A5XX_RB_BLEND_CNTL_SAMPLE_MASK(sample_mask));
+@@ -1696,8 +1698,23 @@ tu5_draw(struct tu_cmd_buffer *cmd, const struct tu5_draw_info *info)
+        !cmd->state.attachments[0])
+       return;
+ 
+-   const struct tu_image_view *iview = cmd->state.attachments[0];
++   const struct tu_subpass *subpass = cmd->state.subpass;
++   const struct tu_image_view *iviews[8] = {};
++   unsigned nr = 0;
++
++   for (unsigned i = 0; subpass && i < MIN2(subpass->color_count, 8u); i++) {
++      uint32_t att = subpass->color_attachments[i].attachment;
++      if (att == VK_ATTACHMENT_UNUSED)
++         continue;
++      iviews[i] = cmd->state.attachments[att];
++      if (iviews[i])
++         nr = i + 1;
++   }
++
++   if (!nr)
++      return;
+ 
++   const struct tu_image_view *iview = iviews[0];
+    if (tu5_gfx_debug()) {
+       const struct ir3_shader_variant *vs_dbg = vs_shader->variant;
+       const struct ir3_shader_variant *fs_dbg = fs_shader->variant;
+@@ -1763,7 +1780,7 @@ tu5_draw(struct tu_cmd_buffer *cmd, const struct tu5_draw_info *info)
+    tu_cs_emit(cs, A5XX_GRAS_SC_DEST_MSAA_CNTL_SAMPLES(MSAA_ONE) |
+                   A5XX_GRAS_SC_DEST_MSAA_CNTL_MSAA_DISABLE);
+ 
+-   tu5_emit_mrt(cmd, iview, fb->width, fb->height);
++   tu5_emit_mrt(cmd, iviews, nr);
+    if (tu5_gfx_clear())
+       tu5_emit_clear(cmd, 0xff0000ffu);
+    tu5_emit_viewport(cmd, fb->width, fb->height);

@@ -3179,11 +3179,20 @@ tu_copy_memory_to_image(struct tu_device *device,
                                      &device->physical_device->ubwc_config);
       }
 
-      if (dst_image->mem->bo->cached_non_coherent) {
+      if (device->physical_device->has_cached_non_coherent_memory) {
          tu_bo_sync_cache(device, dst_image->mem->bo,
                           dst_image->mem_offset + image_offset,
                           dst_layer_size, TU_MEM_SYNC_CACHE_TO_GPU);
       }
+   }
+
+   /* Be conservative: flush the whole image BO as well. The per-layer range
+    * uses the layout slice size, which can be smaller than the real linear
+    * allocation for some mip/layout combinations.
+    */
+   if (device->physical_device->has_cached_non_coherent_memory) {
+      tu_bo_sync_cache(device, dst_image->mem->bo, dst_image->mem_offset,
+                       VK_WHOLE_SIZE, TU_MEM_SYNC_CACHE_TO_GPU);
    }
 }
 
@@ -3394,7 +3403,7 @@ tu_copy_image_to_memory(struct tu_device *device,
    char *dst = static_cast<char *>(info->pHostPointer);
    for (unsigned layer = 0; layer < layers; layer++,
         src += src_layer_stride, dst += dst_layer_stride) {
-      if (src_image->mem->bo->cached_non_coherent) {
+      if (device->physical_device->has_cached_non_coherent_memory) {
          tu_bo_sync_cache(device, src_image->mem->bo,
                           src_image->mem_offset + image_offset,
                           src_layer_size, TU_MEM_SYNC_CACHE_FROM_GPU);
@@ -3500,7 +3509,7 @@ tu5_copy_buffer_cpu(struct tu_device *device,
    if (result != VK_SUCCESS)
       return result;
 
-   if (src_buffer->bo->cached_non_coherent) {
+   if (device->physical_device->has_cached_non_coherent_memory) {
       tu_bo_sync_cache(device, src_buffer->bo, region->srcOffset,
                        region->size, TU_MEM_SYNC_CACHE_FROM_GPU);
    }
@@ -3509,7 +3518,7 @@ tu5_copy_buffer_cpu(struct tu_device *device,
           static_cast<char *>(src_buffer->bo->map) + region->srcOffset,
           region->size);
 
-   if (dst_buffer->bo->cached_non_coherent) {
+   if (device->physical_device->has_cached_non_coherent_memory) {
       tu_bo_sync_cache(device, dst_buffer->bo, region->dstOffset,
                        region->size, TU_MEM_SYNC_CACHE_TO_GPU);
    }
@@ -3537,7 +3546,7 @@ tu5_fill_buffer_cpu(struct tu_device *device,
    if (ptr < end)
       memcpy(ptr, &data, end - ptr);
 
-   if (buffer->bo->cached_non_coherent) {
+   if (device->physical_device->has_cached_non_coherent_memory) {
       tu_bo_sync_cache(device, buffer->bo, offset, size,
                        TU_MEM_SYNC_CACHE_TO_GPU);
    }
@@ -3557,7 +3566,7 @@ tu5_update_buffer_cpu(struct tu_device *device,
 
    memcpy(static_cast<char *>(buffer->bo->map) + offset, data, size);
 
-   if (buffer->bo->cached_non_coherent) {
+   if (device->physical_device->has_cached_non_coherent_memory) {
       tu_bo_sync_cache(device, buffer->bo, offset, size,
                        TU_MEM_SYNC_CACHE_TO_GPU);
    }
@@ -3625,7 +3634,7 @@ tu5_clear_color_image_cpu(struct tu_device *device,
       }
    }
 
-   if (image->mem->bo->cached_non_coherent) {
+   if (device->physical_device->has_cached_non_coherent_memory) {
       tu_bo_sync_cache(device, image->mem->bo, image->mem_offset,
                        VK_WHOLE_SIZE, TU_MEM_SYNC_CACHE_TO_GPU);
    }
@@ -3647,7 +3656,7 @@ tu5_copy_buffer_to_image(struct tu_device *device,
    if (result != VK_SUCCESS)
       return result;
 
-   if (src_buffer->bo->cached_non_coherent) {
+   if (device->physical_device->has_cached_non_coherent_memory) {
       tu_bo_sync_cache(device, src_buffer->bo, info->bufferOffset,
                        VK_WHOLE_SIZE, TU_MEM_SYNC_CACHE_FROM_GPU);
    }
@@ -3693,7 +3702,7 @@ tu5_copy_image_to_buffer(struct tu_device *device,
 
    tu_copy_image_to_memory(device, src_image, image_map, &copy, false);
 
-   if (dst_buffer->bo->cached_non_coherent) {
+   if (device->physical_device->has_cached_non_coherent_memory) {
       tu_bo_sync_cache(device, dst_buffer->bo, info->bufferOffset,
                        VK_WHOLE_SIZE, TU_MEM_SYNC_CACHE_TO_GPU);
    }
@@ -4079,7 +4088,7 @@ tu_copy_image_to_image_cpu(struct tu_device *device,
    char *dst = dst_map + dst_image_offset;
    for (unsigned layer = 0; layer < layers_to_copy; layer++,
         src += src_layer_stride, dst += dst_layer_stride) {
-      if (src_image->mem->bo->cached_non_coherent) {
+      if (device->physical_device->has_cached_non_coherent_memory) {
          tu_bo_sync_cache(device, src_image->mem->bo,
                           src_image->mem_offset + src_image_offset,
                           src_layer_size, TU_MEM_SYNC_CACHE_FROM_GPU);
@@ -4159,7 +4168,7 @@ tu_copy_image_to_image_cpu(struct tu_device *device,
          }
       }
 
-      if (dst_image->mem->bo->cached_non_coherent) {
+      if (device->physical_device->has_cached_non_coherent_memory) {
          tu_bo_sync_cache(device, dst_image->mem->bo,
                           dst_image->mem_offset + dst_image_offset,
                           dst_layer_size, TU_MEM_SYNC_CACHE_TO_GPU);

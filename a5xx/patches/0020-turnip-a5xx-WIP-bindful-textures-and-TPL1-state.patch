@@ -1,0 +1,383 @@
+From 92caef46eea022412d063cc953887403dfee85ea Mon Sep 17 00:00:00 2001
+From: opencode <user@example.com>
+Date: Fri, 20 Nov 2026 12:40:20 +0200
+Subject: [PATCH 20/29] turnip/a5xx: WIP bindful textures and TPL1 state
+
+- Lower sampler2D derefs to bindful TPL1 slots (Vulkan binding == slot)
+  instead of bindless descriptors on chip 5.
+- Emit TPL1 sampler state (4 dwords) and texture state (12 dwords) from
+  the packed A6xx descriptors; the field layout overlaps A5xx TEX_CONST
+  for the fields we need, and chip 5 images are linear.
+- Program the full TPL1_MODE_CNTL value (bank bits + fd5 flags).
+
+Status: texture sampling itself works - tu5_tex_fc_test samples a
+red/green 64x64 texture correctly via gl_FragCoord. The varying-based
+tu5_tex_test returns a constant (0,0) UV, and a later run hung the GPU;
+a warm reboot did not recover it (needs a full power-off). VPC_VAR_DISABLE
+now matches fd5 (computed before appending POS/PSIZ), but that fix is
+untested. Debug output for FS inputs / VS outputs / linkage is included
+under TU5_GFX_DEBUG.
+---
+ src/freedreno/vulkan/tu5_graphics.cc | 166 ++++++++++++++++++++++++++-
+ src/freedreno/vulkan/tu_shader.cc    |  80 +++++++++++++
+ src/freedreno/vulkan/tu_shader.h     |  10 ++
+ 3 files changed, 250 insertions(+), 6 deletions(-)
+
+diff --git a/src/freedreno/vulkan/tu5_graphics.cc b/src/freedreno/vulkan/tu5_graphics.cc
+index 2aa198b..586689c 100644
+--- a/src/freedreno/vulkan/tu5_graphics.cc
++++ b/src/freedreno/vulkan/tu5_graphics.cc
+@@ -20,6 +20,7 @@
+ 
+ #include "tu_cmd_buffer.h"
+ #include "tu_image.h"
++#include "tu_sampler.h"
+ #include "tu_shader.h"
+ 
+ #include "ir3/ir3_shader.h"
+@@ -377,9 +378,21 @@ tu5_emit_program(struct tu_cmd_buffer *cmd,
+    (void)pos_loc_final;
+    (void)psize_loc_final;
+ 
++   /* fd5 computes this mask before appending POS/PSIZ to the linkage. */
++   uint32_t varmask[4] = {
++      linkage->varmask[0], linkage->varmask[1],
++      linkage->varmask[2], linkage->varmask[3],
++   };
++   if (pos_loc != 0xff) {
++      for (unsigned i = 0; i < 4; i++)
++         varmask[(pos_loc + i) / 32] &= ~(1u << ((pos_loc + i) % 32));
++   }
++   if (psize_loc != 0xff)
++      varmask[psize_loc / 32] &= ~(1u << (psize_loc % 32));
++
+    tu_cs_emit_pkt4(cs, REG_A5XX_VPC_VAR_DISABLE(0), 4);
+    for (unsigned i = 0; i < 4; i++)
+-      tu_cs_emit(cs, ~linkage->varmask[i]);
++      tu_cs_emit(cs, ~varmask[i]);
+ 
+    for (unsigned i = 0, j = 0; i < 16 && j < linkage->cnt; i++) {
+       uint32_t reg = A5XX_SP_VS_OUT_REG_A_REGID(linkage->var[j].regid) |
+@@ -901,6 +914,15 @@ tu5_emit_global_state(struct tu_cmd_buffer *cmd)
+    tu5_emit_reg(cs, REG_A5XX_GRAS_SC_BIN_CNTL, 0);
+    tu5_emit_reg(cs, REG_A5XX_GRAS_SU_CONSERVATIVE_RAS_CNTL, 0);
+    tu5_emit_reg(cs, REG_A5XX_VPC_FS_PRIMITIVEID_CNTL, 0xff);
++
++   /* The kernel only programs the highest-bank-bit field; fd5 also sets the
++    * TPL1 mode flags. Texturing needs the full value.
++    */
++   uint32_t hbb = cmd->device->physical_device->info->highest_bank_bit;
++   if (hbb >= 13 && hbb <= 16) {
++      tu5_emit_reg(cs, REG_A5XX_TPL1_MODE_CNTL,
++                   0x444 | A5XX_TPL1_MODE_CNTL_HIGHESTBANKBIT(hbb - 13));
++   }
+ }
+ 
+ /* A5xx sysmem rendering has no GMEM, so RB_CLEAR_CNTL cannot be used to
+@@ -1185,6 +1207,127 @@ tu5_emit_mrt(struct tu_cmd_buffer *cmd,
+    tu5_emit_reg(cs, REG_A5XX_RB_RENDER_COMPONENTS, components);
+ }
+ 
++/* The A6xx MEMOBJ descriptor field layout overlaps A5xx TEX_CONST for the
++ * fields we need (format, swizzle, size, pitch, type, base, depth). The
++ * chip 5 images are linear, so force the tile mode. A5xx uses an explicit
++ * base register instead of a bindless descriptor vector.
++ */
++static void
++tu5_texture_descriptor(const uint32_t *src, uint32_t *dst)
++{
++   dst[0] = (src[0] & ~0x3u) | A5EN_TILE5_LINEAR;
++   dst[1] = src[1] & 0x3fffffffu;
++   dst[2] = src[2];
++   dst[3] = (src[3] & 0x3fffu) | (src[3] & 0x08000000u);
++   dst[4] = src[4] & ~0x1fu;
++   dst[5] = src[5] & 0x3fffffffu;
++   for (unsigned i = 6; i < 12; i++)
++      dst[i] = 0;
++}
++
++/* A5xx sampler words 0/1 match A6xx, word 2 only has BCOLOR_OFFSET instead
++ * of the A6xx border-color selectors. */
++static void
++tu5_sampler_descriptor(const uint32_t *src, uint32_t *dst)
++{
++   dst[0] = src[0];
++   dst[1] = src[1] & ~0x1u;
++   dst[2] = 0;
++   dst[3] = 0;
++}
++
++static void
++tu5_emit_textures(struct tu_cmd_buffer *cmd, struct tu_shader *shader,
++                  enum a4xx_state_block sb)
++{
++   if (!shader->num_textures && !shader->num_samplers)
++      return;
++
++   struct tu_descriptor_state *ds =
++      tu_get_descriptors_state(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
++   uint32_t samplers[TU5_MAX_SAMPLERS][4] = {};
++   uint32_t textures[TU5_MAX_TEXTURES][12] = {};
++
++   for (unsigned i = 0; i < shader->num_samplers; i++) {
++      unsigned set = shader->samp_map[i].set;
++      unsigned binding = shader->samp_map[i].binding;
++      const struct tu_descriptor_set *dset =
++         set < MAX_SETS ? ds->sets[set] : NULL;
++
++      if (!dset || binding >= dset->layout->binding_count)
++         continue;
++
++      const struct tu_descriptor_set_binding_layout *bl =
++         &dset->layout->binding[binding];
++      const uint32_t *src = NULL;
++
++      if (bl->immutable_samplers_offset) {
++         const struct tu_sampler *immutable =
++            tu_immutable_samplers(dset->layout, bl);
++         if (immutable)
++            src = immutable->descriptor;
++      } else if (dset->mapped_ptr) {
++         if (bl->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
++            src = dset->mapped_ptr + bl->offset / 4 + FDL6_TEX_CONST_DWORDS;
++         else if (bl->type == VK_DESCRIPTOR_TYPE_SAMPLER)
++            src = dset->mapped_ptr + bl->offset / 4;
++      }
++
++      if (src)
++         tu5_sampler_descriptor(src, samplers[i]);
++   }
++
++   for (unsigned i = 0; i < shader->num_textures; i++) {
++      unsigned set = shader->tex_map[i].set;
++      unsigned binding = shader->tex_map[i].binding;
++      const struct tu_descriptor_set *dset =
++         set < MAX_SETS ? ds->sets[set] : NULL;
++
++      if (!dset || binding >= dset->layout->binding_count ||
++          !dset->mapped_ptr)
++         continue;
++
++      const struct tu_descriptor_set_binding_layout *bl =
++         &dset->layout->binding[binding];
++      if (bl->type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
++          bl->type != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE &&
++          bl->type != VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT)
++         continue;
++
++      tu5_texture_descriptor(dset->mapped_ptr + bl->offset / 4, textures[i]);
++   }
++
++   struct tu_cs *cs = &cmd->cs;
++
++   if (shader->num_samplers) {
++      tu_cs_emit_pkt7(cs, CP_LOAD_STATE4, 3 + 4 * shader->num_samplers);
++      tu_cs_emit(cs, CP_LOAD_STATE4_0_DST_OFF(0) |
++                       CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
++                       CP_LOAD_STATE4_0_STATE_BLOCK(sb) |
++                       CP_LOAD_STATE4_0_NUM_UNIT(shader->num_samplers));
++      tu_cs_emit(cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_SHADER) |
++                       CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
++      tu_cs_emit(cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
++      for (unsigned i = 0; i < shader->num_samplers; i++)
++         for (unsigned j = 0; j < 4; j++)
++            tu_cs_emit(cs, samplers[i][j]);
++   }
++
++   if (shader->num_textures) {
++      tu_cs_emit_pkt7(cs, CP_LOAD_STATE4, 3 + 12 * shader->num_textures);
++      tu_cs_emit(cs, CP_LOAD_STATE4_0_DST_OFF(0) |
++                       CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
++                       CP_LOAD_STATE4_0_STATE_BLOCK(sb) |
++                       CP_LOAD_STATE4_0_NUM_UNIT(shader->num_textures));
++      tu_cs_emit(cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
++                       CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
++      tu_cs_emit(cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
++      for (unsigned i = 0; i < shader->num_textures; i++)
++         for (unsigned j = 0; j < 12; j++)
++            tu_cs_emit(cs, textures[i][j]);
++   }
++}
++
+ static void
+ tu5_emit_viewport(struct tu_cmd_buffer *cmd, uint32_t width, uint32_t height)
+ {
+@@ -1733,6 +1876,11 @@ tu5_draw(struct tu_cmd_buffer *cmd, const struct tu5_draw_info *info)
+               fs_dbg->instrlen, fs_dbg->constlen, fs_dbg->total_in,
+               ir3_find_output_regid(fs_dbg, FRAG_RESULT_DATA0),
+               ir3_find_output_regid(fs_dbg, FRAG_RESULT_COLOR));
++      for (unsigned k = 0; k < fs_dbg->inputs_count; k++)
++         fprintf(stderr, "    fs_in[%u]: slot=%u compmask=0x%x inloc=%u"
++                         " flat=%d bary=%d\n", k, fs_dbg->inputs[k].slot,
++                 fs_dbg->inputs[k].compmask, fs_dbg->inputs[k].inloc,
++                 fs_dbg->inputs[k].flat, fs_dbg->inputs[k].bary);
+    }
+ 
+    struct ir3_shader_linkage linkage = {};
+@@ -1785,16 +1933,22 @@ tu5_draw(struct tu_cmd_buffer *cmd, const struct tu5_draw_info *info)
+       tu5_emit_clear(cmd, 0xff0000ffu);
+    tu5_emit_viewport(cmd, fb->width, fb->height);
+    if (tu5_gfx_debug()) {
+-      fprintf(stderr, "  link: cnt=%u max_loc=%u var0={regid=0x%x compmask=0x%x loc=%u} var1={regid=0x%x compmask=0x%x loc=%u} pos_loc=%u psize_loc=%u\n",
+-              linkage.cnt, linkage.max_loc,
+-              linkage.var[0].regid, linkage.var[0].compmask, linkage.var[0].loc,
+-              linkage.var[1].regid, linkage.var[1].compmask, linkage.var[1].loc,
+-              pos_loc, psize_loc);
++      fprintf(stderr, "  link: cnt=%u max_loc=%u pos_loc=%u psize_loc=%u varmask=%08x %08x\n",
++              linkage.cnt, linkage.max_loc, pos_loc, psize_loc,
++              linkage.varmask[0], linkage.varmask[1]);
++      for (unsigned k = 0; k < linkage.cnt; k++)
++         fprintf(stderr, "    var[%u]: slot=%u regid=0x%x compmask=0x%x loc=%u\n",
++                 k, linkage.var[k].slot, linkage.var[k].regid,
++                 linkage.var[k].compmask, linkage.var[k].loc);
+    }
+    tu5_emit_program(cmd, vs_shader, fs_shader, &linkage, pos_loc, psize_loc);
+    tu5_emit_vs_driver_params(cmd, vs_shader, info);
+    tu5_emit_gfx_ssbo_state(cmd, vs_shader, SB4_VS_SHADER);
+    tu5_emit_gfx_ssbo_state(cmd, fs_shader, SB4_FS_SHADER);
++   tu5_emit_textures(cmd, vs_shader, SB4_VS_TEX);
++   tu5_emit_textures(cmd, fs_shader, SB4_FS_TEX);
++   tu5_emit_reg(cs, REG_A5XX_TPL1_VS_TEX_COUNT, vs_shader->num_textures);
++   tu5_emit_reg(cs, REG_A5XX_TPL1_FS_TEX_COUNT, fs_shader->num_textures);
+    tu5_emit_rasterizer(cmd, vs_shader, fs_shader, linkage.max_loc);
+    tu5_emit_vertex_inputs(cmd, vs_shader);
+ 
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index 3cd1d54..558148e 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -1071,12 +1071,73 @@ lower_tex_texel_buffer_to_image(
+    }
+ }
+ 
++/* a5xx has bindful textures: encode the Vulkan binding number directly as
++ * the TPL1 texture/sampler slot and drop the descriptor deref sources. The
++ * driver emits TPL1 state for those slots at draw time.
++ */
++static bool
++tu5_lower_bindful_tex(nir_tex_instr *tex, struct tu_shader *shader, bool ref)
++{
++   int tex_idx = nir_tex_instr_src_index(
++      tex, ref ? nir_tex_src_texture_2_deref : nir_tex_src_texture_deref);
++   int samp_idx = nir_tex_instr_src_index(
++      tex, ref ? nir_tex_src_sampler_2_deref : nir_tex_src_sampler_deref);
++
++   if (tex_idx >= 0) {
++      nir_deref_instr *deref = nir_src_as_deref(tex->src[tex_idx].src);
++      nir_variable *var = nir_deref_instr_get_variable(deref);
++      if (!var || var->data.descriptor_set != 0 ||
++          var->data.binding >= TU5_MAX_TEXTURES)
++         return false;
++
++      unsigned binding = var->data.binding;
++      shader->tex_map[binding].set = var->data.descriptor_set;
++      shader->tex_map[binding].binding = binding;
++      shader->num_textures = MAX2(shader->num_textures, binding + 1);
++      tex->texture_index = binding;
++   }
++
++   if (samp_idx >= 0) {
++      nir_deref_instr *deref = nir_src_as_deref(tex->src[samp_idx].src);
++      nir_variable *var = nir_deref_instr_get_variable(deref);
++      if (!var || var->data.descriptor_set != 0 ||
++          var->data.binding >= TU5_MAX_SAMPLERS)
++         return false;
++
++      unsigned binding = var->data.binding;
++      shader->samp_map[binding].set = var->data.descriptor_set;
++      shader->samp_map[binding].binding = binding;
++      shader->num_samplers = MAX2(shader->num_samplers, binding + 1);
++      tex->sampler_index = binding;
++   }
++
++   /* Remove the deref sources, higher index first. */
++   if (tex_idx >= 0 && samp_idx >= 0) {
++      if (tex_idx > samp_idx) {
++         nir_tex_instr_remove_src(tex, tex_idx);
++         nir_tex_instr_remove_src(tex, samp_idx);
++      } else {
++         nir_tex_instr_remove_src(tex, samp_idx);
++         nir_tex_instr_remove_src(tex, tex_idx);
++      }
++   } else if (tex_idx >= 0) {
++      nir_tex_instr_remove_src(tex, tex_idx);
++   } else if (samp_idx >= 0) {
++      nir_tex_instr_remove_src(tex, samp_idx);
++   }
++
++   return true;
++}
++
+ static bool
+ lower_tex_impl(nir_builder *b, nir_tex_instr *tex, struct tu_device *dev,
+           struct tu_shader *shader, const struct tu_pipeline_layout *layout,
+           uint32_t read_only_input_attachments, bool dynamic_renderpass,
+           bool ref)
+ {
++   if (dev->physical_device->info->chip == 5)
++      return tu5_lower_bindful_tex(tex, shader, ref);
++
+    bool descriptor_valid = true;
+    int sampler_src_idx = nir_tex_instr_src_index(tex, ref ? nir_tex_src_sampler_2_deref : nir_tex_src_sampler_deref);
+    if (sampler_src_idx >= 0) {
+@@ -3975,6 +4036,9 @@ tu_shader_create(struct tu_device *dev,
+ 
+    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+ 
++   if (dev->physical_device->info->chip == 5)
++      nir->info.num_textures = shader->num_textures;
++
+    struct ir3_shader_nir_options nir_options;
+    init_ir3_nir_options(&nir_options, key);
+ 
+@@ -4018,6 +4082,22 @@ tu_shader_create(struct tu_device *dev,
+    shader->variant =
+       ir3_shader_create_variant(ir3_shader, ir3_key, executable_info);
+ 
++   if (dev->physical_device->info->chip == 5 && getenv("TU5_GFX_DEBUG")) {
++      const struct ir3_shader_variant *v = shader->variant;
++      fprintf(stderr, "tu5 shader stage=%u: inputs=%u outputs=%u total_in=%u"
++                      " constlen=%u instrlen=%u\n", v->type, v->inputs_count,
++              v->outputs_count, v->total_in, v->constlen, v->instrlen);
++      for (unsigned i = 0; i < v->inputs_count; i++)
++         fprintf(stderr, "  in[%u]: slot=%u sysval=%d compmask=0x%x"
++                         " inloc=%u flat=%d bary=%d regid=0x%x\n",
++                 i, v->inputs[i].slot, v->inputs[i].sysval,
++                 v->inputs[i].compmask, v->inputs[i].inloc,
++                 v->inputs[i].flat, v->inputs[i].bary, v->inputs[i].regid);
++      for (unsigned i = 0; i < v->outputs_count; i++)
++         fprintf(stderr, "  out[%u]: slot=%u regid=0x%x\n",
++                 i, v->outputs[i].slot, v->outputs[i].regid);
++   }
++
+    if (ir3_exceeds_safe_constlen(shader->variant)) {
+       struct ir3_shader_key safe_constlen_key = *ir3_key;
+       safe_constlen_key.safe_constlen = true;
+diff --git a/src/freedreno/vulkan/tu_shader.h b/src/freedreno/vulkan/tu_shader.h
+index e196a9e..0a5d4a9 100644
+--- a/src/freedreno/vulkan/tu_shader.h
++++ b/src/freedreno/vulkan/tu_shader.h
+@@ -64,6 +64,8 @@ struct tu_const_state
+  */
+ #define TU5_MAX_SSBOS 8
+ #define TU5_MAX_UBOS 8
++#define TU5_MAX_TEXTURES 16
++#define TU5_MAX_SAMPLERS 16
+ 
+ struct tu_shader
+ {
+@@ -96,6 +98,14 @@ struct tu_shader
+    struct {
+       uint8_t set, binding;
+    } ubo_map[TU5_MAX_UBOS];
++   uint8_t num_textures;
++   struct {
++      uint8_t set, binding;
++   } tex_map[TU5_MAX_TEXTURES];
++   uint8_t num_samplers;
++   struct {
++      uint8_t set, binding;
++   } samp_map[TU5_MAX_SAMPLERS];
+ 
+    /* The dynamic buffer descriptor size for descriptor sets that we know
+     * about. This is used when linking to piece together the sizes and from

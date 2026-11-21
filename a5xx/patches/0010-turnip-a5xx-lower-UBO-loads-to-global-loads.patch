@@ -1,0 +1,102 @@
+From a5d864c40c8bfeb992210be799168499426a89a8 Mon Sep 17 00:00:00 2001
+From: local <local@local>
+Date: Thu, 19 Nov 2026 22:51:18 +0200
+Subject: [PATCH 10/29] turnip/a5xx: lower UBO loads to global loads
+
+Avoid the fragile pre-a6xx UBO const-range path: reserve one 64-bit
+pointer per UBO slot in const state, lower load_ubo to load_global at
+dispatch, and upload only the pointers. Slots are indexed by Vulkan
+binding so binding 1 does not alias slot 0.
+
+Not hardware-tested after the previous UBO hang; baseline compute still
+passes.
+---
+ src/freedreno/vulkan/tu5_compute.cc |  1 +
+ src/freedreno/vulkan/tu_shader.cc   | 45 +++++++++++++++++++++++++----
+ 2 files changed, 41 insertions(+), 5 deletions(-)
+
+diff --git a/src/freedreno/vulkan/tu5_compute.cc b/src/freedreno/vulkan/tu5_compute.cc
+index 4c9331b..b7c9f41 100644
+--- a/src/freedreno/vulkan/tu5_compute.cc
++++ b/src/freedreno/vulkan/tu5_compute.cc
+@@ -414,6 +414,7 @@ tu5_dispatch(struct tu_cmd_buffer *cmd, const struct tu_dispatch_info *info)
+    tu5_emit_push_consts(cmd, v);
+    tu5_emit_ssbo_state(cmd);
+    tu5_emit_ubo_state(cmd);
++   tu5_emit_ubo_state(cmd);
+ 
+    const uint16_t *local_size = v->local_size;
+    const uint32_t *num_groups = info->blocks;
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index ae60a2d..92ac4a6 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -1634,6 +1634,29 @@ tu5_lower_ssbo_size_instr(nir_builder *b, nir_instr *instr, void *data)
+    return true;
+ }
+ 
++static bool
++tu5_lower_ubo_global(nir_builder *b, nir_instr *instr, void *data)
++{
++   if (instr->type != nir_instr_type_intrinsic)
++      return false;
++   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++   if (intr->intrinsic != nir_intrinsic_load_ubo ||
++       !nir_src_is_const(intr->src[0]))
++      return false;
++
++   unsigned binding = nir_src_as_uint(intr->src[0]);
++   uint32_t base = *(const uint32_t *)data + binding * 2;
++   nir_builder b_at = nir_builder_at(nir_before_instr(instr));
++   nir_def *lo = nir_load_const_ir3(&b_at, 1, 32, nir_imm_int(&b_at, 0), .base = base);
++   nir_def *hi = nir_load_const_ir3(&b_at, 1, 32, nir_imm_int(&b_at, 0), .base = base + 1);
++   nir_def *ptr = nir_pack_64_2x32(&b_at, nir_vec2(&b_at, lo, hi));
++   nir_def *addr = nir_iadd(&b_at, ptr, nir_u2u64(&b_at, intr->src[1].ssa));
++   nir_def *val = nir_load_global(&b_at, intr->num_components,
++                                  intr->def.bit_size, addr);
++   nir_def_replace(&intr->def, val);
++   return true;
++}
++
+ static bool
+ tu_lower_io(nir_shader *shader, struct tu_device *dev,
+             struct tu_shader *tu_shader,
+@@ -3902,14 +3925,17 @@ tu_shader_create(struct tu_device *dev,
+    if (dev->physical_device->info->chip == 5) {
+       nir_foreach_variable_with_modes (var, nir, nir_var_mem_ubo) {
+          if (var->data.descriptor_set != 0 ||
+-             var->data.binding >= TU5_MAX_UBOS ||
+-             shader->num_ubos >= TU5_MAX_UBOS) {
++             var->data.binding >= TU5_MAX_UBOS) {
+             vk_free(&dev->vk.alloc, shader);
+             return VK_ERROR_FEATURE_NOT_PRESENT;
+          }
+-         shader->ubo_map[shader->num_ubos].set = var->data.descriptor_set;
+-         shader->ubo_map[shader->num_ubos].binding = var->data.binding;
+-         shader->num_ubos++;
++         while (shader->num_ubos <= var->data.binding) {
++            shader->ubo_map[shader->num_ubos].set = 0;
++            shader->ubo_map[shader->num_ubos].binding = 0;
++            shader->num_ubos++;
++         }
++         shader->ubo_map[var->data.binding].set = var->data.descriptor_set;
++         shader->ubo_map[var->data.binding].binding = var->data.binding;
+       }
+    }
+ 
+@@ -3933,6 +3959,15 @@ tu_shader_create(struct tu_device *dev,
+                tu5_lower_ssbo_size_instr, nir_metadata_none, &size_base);
+    }
+ 
++   if (dev->physical_device->info->chip == 5 && shader->num_ubos) {
++      uint32_t ptrs_vec4 = DIV_ROUND_UP(shader->num_ubos * 2, 4);
++      ir3_const_alloc(&const_allocs, IR3_CONST_ALLOC_UBO_PTRS, ptrs_vec4, 1);
++      uint32_t base = const_allocs.consts[IR3_CONST_ALLOC_UBO_PTRS].offset_vec4 * 4;
++      NIR_PASS(_, nir, nir_shader_instructions_pass,
++               tu5_lower_ubo_global, nir_metadata_none, &base);
++      nir->info.num_ubos = 0;
++   }
++
+    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+ 
+    struct ir3_shader_nir_options nir_options;

@@ -1,0 +1,127 @@
+From fbe11fb737ffd15e36d3b7e601026a00ed833432 Mon Sep 17 00:00:00 2001
+From: Kulesha Evgeniy <voovdop@gmail.com>
+Date: Fri, 20 Nov 2026 16:35:33 +0200
+Subject: [PATCH 26/29] turnip/a5xx: upload graphics UBO pointers to const
+ state
+
+a5xx lowers UBO loads to global loads through pointers in
+IR3_CONST_ALLOC_UBO_PTRS. The compute path uploaded them, but the
+graphics path did not: it only pushed SSBO addresses into the UBO state
+block. Any VS/FS with a real UBO (e.g. vkcube's MVP matrix) dereferenced
+a zero pointer and hung the GPU.
+
+Add tu5_emit_gfx_ubo_state()/tu5_get_gfx_ubo_addr() for VS and FS,
+mirroring the compute path (pointer table + static ranges).
+---
+ src/freedreno/vulkan/tu5_graphics.cc | 91 ++++++++++++++++++++++++++++
+ 1 file changed, 91 insertions(+)
+
+diff --git a/src/freedreno/vulkan/tu5_graphics.cc b/src/freedreno/vulkan/tu5_graphics.cc
+index 5809737..48e571a 100644
+--- a/src/freedreno/vulkan/tu5_graphics.cc
++++ b/src/freedreno/vulkan/tu5_graphics.cc
+@@ -879,6 +879,95 @@ tu5_emit_gfx_ssbo_state(struct tu_cmd_buffer *cmd,
+    }
+ }
+ 
++static uint64_t
++tu5_get_gfx_ubo_addr(struct tu_cmd_buffer *cmd, unsigned binding)
++{
++   struct tu_descriptor_state *ds =
++      tu_get_descriptors_state(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
++   struct tu_descriptor_set *dset = ds->sets[0];
++
++   if (!dset || binding >= dset->layout->binding_count || !dset->mapped_ptr)
++      return 0;
++
++   const struct tu_descriptor_set_binding_layout *bl =
++      &dset->layout->binding[binding];
++   if (bl->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
++      return 0;
++
++   const uint32_t *desc = dset->mapped_ptr + bl->offset / 4;
++   return desc[0] | ((uint64_t)(desc[1] & 0x1ffff) << 32);
++}
++
++static void
++tu5_emit_gfx_ubo_state(struct tu_cmd_buffer *cmd,
++                       struct tu_shader *shader,
++                       enum a4xx_state_block shader_sb)
++{
++   if (!shader || !shader->num_ubos)
++      return;
++
++   const struct ir3_shader_variant *v = shader->variant;
++   const struct ir3_const_allocations *allocs = &v->const_state->allocs;
++
++   /* a5xx UBO loads are lowered to global loads through pointers stored in
++    * const state. Without uploading them the shader dereferences garbage
++    * (usually 0) and the GPU hangs.
++    */
++   if (ir3_const_can_upload(allocs, IR3_CONST_ALLOC_UBO_PTRS, v->constlen)) {
++      uint32_t off = allocs->consts[IR3_CONST_ALLOC_UBO_PTRS].offset_vec4;
++      unsigned slots = MAX2((unsigned)shader->num_ubos,
++                            v->const_state->num_ubos);
++      unsigned units = DIV_ROUND_UP(slots * 2, 4);
++
++      tu_cs_emit_pkt7(&cmd->cs, CP_LOAD_STATE4, 3 + units * 4);
++      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_0_DST_OFF(off) |
++                               CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
++                               CP_LOAD_STATE4_0_STATE_BLOCK(shader_sb) |
++                               CP_LOAD_STATE4_0_NUM_UNIT(units));
++      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
++                               CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
++      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
++
++      for (unsigned i = 0; i < units * 4; i++) {
++         unsigned slot = i / 2;
++         uint32_t addr_lo = 0, addr_hi = 0;
++         if (slot < shader->num_ubos) {
++            uint64_t addr =
++               tu5_get_gfx_ubo_addr(cmd, shader->ubo_map[slot].binding);
++            addr_lo = addr;
++            addr_hi = addr >> 32;
++         }
++         tu_cs_emit(&cmd->cs, (i & 1) ? addr_hi : addr_lo);
++      }
++   }
++
++   const struct ir3_ubo_analysis_state *state = &v->const_state->ubo_state;
++   for (unsigned i = 0; i < state->num_enabled; i++) {
++      const struct ir3_ubo_range *r = &state->range[i];
++      uint32_t size = r->end - r->start;
++      if (!size || !ir3_const_can_upload(allocs, IR3_CONST_ALLOC_UBO_RANGES,
++                                         v->constlen))
++         continue;
++
++      uint64_t addr = tu5_get_gfx_ubo_addr(cmd, r->ubo.block);
++      if (!addr)
++         continue;
++
++      unsigned units = size / 16;
++      if (!units)
++         continue;
++
++      tu_cs_emit_pkt7(&cmd->cs, CP_LOAD_STATE4, 3);
++      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_0_DST_OFF(r->offset / 16) |
++                               CP_LOAD_STATE4_0_STATE_SRC(SS4_INDIRECT) |
++                               CP_LOAD_STATE4_0_STATE_BLOCK(shader_sb) |
++                               CP_LOAD_STATE4_0_NUM_UNIT(units));
++      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
++                               CP_LOAD_STATE4_1_EXT_SRC_ADDR((uint32_t)(addr + r->start)));
++      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI((addr + r->start) >> 32));
++   }
++}
++
+ static void
+ tu5_emit_global_state(struct tu_cmd_buffer *cmd)
+ {
+@@ -1959,6 +2048,8 @@ tu5_draw(struct tu_cmd_buffer *cmd, const struct tu5_draw_info *info)
+    tu5_emit_vs_driver_params(cmd, vs_shader, info);
+    tu5_emit_gfx_ssbo_state(cmd, vs_shader, SB4_VS_SHADER);
+    tu5_emit_gfx_ssbo_state(cmd, fs_shader, SB4_FS_SHADER);
++   tu5_emit_gfx_ubo_state(cmd, vs_shader, SB4_VS_SHADER);
++   tu5_emit_gfx_ubo_state(cmd, fs_shader, SB4_FS_SHADER);
+    tu5_emit_textures(cmd, vs_shader, SB4_VS_TEX);
+    tu5_emit_textures(cmd, fs_shader, SB4_FS_TEX);
+    tu5_emit_reg(cs, REG_A5XX_TPL1_VS_TEX_COUNT, vs_shader->num_textures);

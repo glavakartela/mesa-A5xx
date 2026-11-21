@@ -1457,6 +1457,18 @@ tu5_emit_textures(struct tu_cmd_buffer *cmd, struct tu_shader *shader,
 
    struct tu_cs *cs = &cmd->cs;
 
+   if (getenv("TU5_GFX_DEBUG")) {
+      fprintf(stderr, "tu5 tex: sb=%u samplers=%u textures=%u\n",
+              sb, shader->num_samplers, shader->num_textures);
+      for (unsigned i = 0; i < shader->num_samplers; i++)
+         fprintf(stderr, "  samp[%u]=%08x %08x %08x %08x\n", i,
+                 samplers[i][0], samplers[i][1], samplers[i][2], samplers[i][3]);
+      for (unsigned i = 0; i < shader->num_textures; i++)
+         fprintf(stderr, "  tex[%u]=%08x %08x %08x %08x %08x\n", i,
+                 textures[i][0], textures[i][1], textures[i][2],
+                 textures[i][3], textures[i][4]);
+   }
+
    if (shader->num_samplers) {
       tu_cs_emit_pkt7(cs, CP_LOAD_STATE4, 3 + 4 * shader->num_samplers);
       tu_cs_emit(cs, CP_LOAD_STATE4_0_DST_OFF(0) |
@@ -1484,6 +1496,9 @@ tu5_emit_textures(struct tu_cmd_buffer *cmd, struct tu_shader *shader,
          for (unsigned j = 0; j < 12; j++)
             tu_cs_emit(cs, textures[i][j]);
    }
+
+   if (getenv("TU5_GFX_TEXWAIT"))
+      tu_cs_emit_pkt7(cs, CP_WAIT_FOR_IDLE, 0);
 }
 
 static void

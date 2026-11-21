@@ -1,0 +1,10 @@
+#version 450
+layout(local_size_x = 64) in;
+layout(push_constant) uniform PC { uint add; } pc;
+layout(set = 0, binding = 0) buffer Buf { uint data[]; } buf;
+layout(set = 0, binding = 1) uniform U { uint uadd; } u;
+void main() {
+   uint i = gl_GlobalInvocationID.x;
+   if (i < buf.data.length())
+      buf.data[i] = i * 3u + pc.add + u.uadd;
+}

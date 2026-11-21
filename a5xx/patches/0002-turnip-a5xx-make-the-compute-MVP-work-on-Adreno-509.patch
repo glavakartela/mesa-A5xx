@@ -1,0 +1,297 @@
+From 16f24748cf308b1d1272767988461c6f874a7e9a Mon Sep 17 00:00:00 2001
+From: local <local@local>
+Date: Thu, 19 Nov 2026 20:42:04 +0200
+Subject: [PATCH 02/29] turnip/a5xx: make the compute MVP work on Adreno 509
+
+Fix the remaining bring-up issues found on hardware:
+
+ - create the ir3 compiler without preamble/shared-const support on a5xx,
+ - skip empty shaders and the binning preamble for the compute-only path,
+ - provide an a5xx trace timestamp callback,
+ - lower SSBO intrinsics to a bindful slot before descriptor lowering and
+   record the SSBO map while the variables still exist,
+ - keep num_ssbos populated for nir_lower_amul,
+ - use an explicit builder cursor in the bindful SSBO pass.
+
+With these, the storage-buffer compute smoke test writes 512/512 correct
+values on Adreno 509.
+
+Generated-by: LLM
+---
+ src/freedreno/vulkan/tu_cmd_buffer.cc |   4 +
+ src/freedreno/vulkan/tu_device.cc     |  27 +++++-
+ src/freedreno/vulkan/tu_shader.cc     | 114 ++++++++++++++++++--------
+ 3 files changed, 106 insertions(+), 39 deletions(-)
+
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index c6c8d41..612b890 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -2407,6 +2407,10 @@ tu_emit_bin_preamble(struct tu_device *dev, struct tu_cs *cs, bool bv)
+ VkResult
+ tu_init_bin_preamble(struct tu_device *device)
+ {
++   /* a5xx compute MVP: there is no binning preamble. */
++   if (device->physical_device->info->chip == 5)
++      return VK_SUCCESS;
++
+    struct tu_cs preamble_cs;
+    VkResult result = tu_cs_begin_sub_stream(&device->sub_cs, 256, &preamble_cs);
+    if (result != VK_SUCCESS)
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index 273828a..97fa4c0 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -2358,6 +2358,23 @@ tu_trace_record_ts(struct u_trace *ut, void *cs, void *timestamps,
+    return true;
+ }
+ 
++/* a5xx trace timestamps: the same CP_EVENT_WRITE form as A6XX. */
++static bool
++tu_trace_record_ts_a5xx(struct u_trace *ut, void *cs, void *timestamps,
++                        uint64_t offset_B, uint32_t flags)
++{
++   struct tu_suballoc_bo *bo = static_cast<struct tu_suballoc_bo *>(timestamps);
++   struct tu_cs *ts_cs = static_cast<struct tu_cs *>(cs);
++
++   tu_cs_emit_pkt7(ts_cs, CP_EVENT_WRITE, 4);
++   tu_cs_emit(ts_cs, CP_EVENT_WRITE_0_EVENT(RB_DONE_TS) |
++                        CP_EVENT_WRITE_0_TIMESTAMP);
++   tu_cs_emit_qw(ts_cs, bo->iova + offset_B);
++   tu_cs_emit(ts_cs, 0x00000000);
++
++   return true;
++}
++
+ static uint64_t
+ tu_trace_read_ts(struct u_trace_context *utctx,
+                  void *timestamps, uint64_t offset_B,
+@@ -3067,14 +3084,16 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
+       goto fail_queues;
+ 
+    {
++      const bool is_a5xx = physical_device->info->chip == 5;
++
+       struct ir3_compiler_options ir3_options = {
+-         .push_ubo_with_preamble = true,
++         .push_ubo_with_preamble = !is_a5xx,
+          .disable_cache = true,
+          .bindless_fb_read_descriptor = -1,
+          .bindless_fb_read_slot = -1,
+          .storage_16bit = physical_device->info->props.storage_16bit,
+          .storage_8bit = physical_device->info->props.storage_8bit,
+-         .shared_push_consts = !TU_DEBUG(PUSH_CONSTS_PER_STAGE),
++         .shared_push_consts = !is_a5xx && !TU_DEBUG(PUSH_CONSTS_PER_STAGE),
+          .uche_trap_base = physical_device->uche_trap_base,
+          .lower_draw_id = physical_device->info->chip >= A8XX,
+       };
+@@ -3311,7 +3330,9 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
+                      12,
+                      tu_trace_create_buffer,
+                      tu_trace_destroy_buffer,
+-                     TU_CALLX(device, tu_trace_record_ts),
++                     physical_device->info->chip == 5 ?
++                        tu_trace_record_ts_a5xx :
++                        TU_CALLX(device, tu_trace_record_ts),
+                      tu_trace_read_ts,
+                      tu_trace_capture_data,
+                      tu_trace_get_data,
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index 507606f..8c926e0 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -206,10 +206,12 @@ tu_spirv_to_nir(struct tu_device *dev,
+    const nir_shader_compiler_options *nir_options =
+       ir3_get_compiler_options(dev->compiler);
+ 
++   spirv_to_nir_options spirv_options = tu_spirv_options;
++
+    nir_shader *nir;
+    VkResult result =
+       vk_pipeline_shader_stage_to_nir(&dev->vk, pipeline_flags, stage_info,
+-                                      &tu_spirv_options, nir_options,
++                                      &spirv_options, nir_options,
+                                       mem_ctx, &nir);
+    if (result != VK_SUCCESS)
+       return NULL;
+@@ -227,8 +229,16 @@ tu_spirv_to_nir(struct tu_device *dev,
+     * UBOs/SSBOs, but spirv_to_nir sets them to the total number of objects
+     * which is useless for us, so reset them here.
+     */
+-   nir->info.num_ubos = 0;
+-   nir->info.num_ssbos = 0;
++   if (dev->physical_device->info->chip == 5) {
++      uint32_t max_ssbo = 0;
++      nir_foreach_variable_with_modes (var, nir, nir_var_mem_ssbo)
++         max_ssbo = MAX2(max_ssbo, var->data.binding + 1);
++      nir->info.num_ubos = 0;
++      nir->info.num_ssbos = max_ssbo;
++   } else {
++      nir->info.num_ubos = 0;
++      nir->info.num_ssbos = 0;
++   }
+ 
+    if (dev->physical_device->compiler_options.compute_round_robin) {
+       nir->info.occupancy_bounded_workgroup_fairness = true;
+@@ -346,15 +356,6 @@ lower_vulkan_resource_index(struct tu_device *dev, nir_builder *b,
+    unsigned set = nir_intrinsic_desc_set(instr);
+    unsigned binding = nir_intrinsic_binding(instr);
+ 
+-   if (dev->physical_device->info->chip == 5) {
+-      /* a5xx has no bindless descriptor memory. isam/ldgb take an immediate
+-       * SSBO state slot, so lower the descriptor to the binding number and
+-       * require set 0 (checked when the shader is created).
+-       */
+-      nir_def_replace(&instr->def, nir_imm_int(b, binding));
+-      return;
+-   }
+-
+    struct tu_descriptor_set_layout *set_layout = layout->set[set].layout;
+    struct tu_descriptor_set_binding_layout *binding_layout =
+       &set_layout->binding[binding];
+@@ -431,17 +432,8 @@ lower_vulkan_resource_reindex(nir_builder *b, nir_intrinsic_instr *instr)
+ }
+ 
+ static void
+-lower_load_vulkan_descriptor(nir_builder *b, nir_intrinsic_instr *intrin,
+-                             struct tu_device *dev)
++lower_load_vulkan_descriptor(nir_builder *b, nir_intrinsic_instr *intrin)
+ {
+-   if (dev->physical_device->info->chip == 5) {
+-      /* a5xx bindful path: vulkan_resource_index already produced the
+-       * scalar SSBO slot and the descriptor load is a no-op.
+-       */
+-      nir_def_replace(&intrin->def, intrin->src[0].ssa);
+-      return;
+-   }
+-
+    nir_def *old_index = intrin->src[0].ssa;
+    /* Loading the descriptor happens as part of the load/store instruction so
+     * this is a no-op. We just need to turn the shift into an offset of 0.
+@@ -793,7 +785,7 @@ lower_intrinsic(nir_builder *b, nir_intrinsic_instr *instr,
+       return true;
+ 
+    case nir_intrinsic_load_vulkan_descriptor:
+-      lower_load_vulkan_descriptor(b, instr, dev);
++      lower_load_vulkan_descriptor(b, instr);
+       return true;
+ 
+    case nir_intrinsic_vulkan_resource_index:
+@@ -1525,6 +1517,39 @@ shader_uses_push_consts(nir_shader *shader)
+    return false;
+ }
+ 
++static bool
++tu5_lower_bindful_ssbo_instr(nir_builder *b, nir_intrinsic_instr *intrin,
++                             void *data)
++{
++   unsigned desc_src;
++
++   switch (intrin->intrinsic) {
++   case nir_intrinsic_load_ssbo:
++   case nir_intrinsic_ssbo_atomic:
++   case nir_intrinsic_ssbo_atomic_swap:
++   case nir_intrinsic_get_ssbo_size:
++      desc_src = 0;
++      break;
++   case nir_intrinsic_store_ssbo:
++      desc_src = 1;
++      break;
++   default:
++      return false;
++   }
++
++   if (intrin->src[desc_src].ssa->num_components == 1)
++      return false;
++
++   /* The builder cursor is unset in instruction passes. */
++   nir_builder b_at = nir_builder_at(nir_before_instr(&intrin->instr));
++
++   /* MVP: only descriptor set 0, binding 0 is accepted for SSBOs, and the
++    * hardware slot equals the binding number.
++    */
++   nir_src_rewrite(&intrin->src[desc_src], nir_imm_int(&b_at, 0));
++   return true;
++}
++
+ static bool
+ tu_lower_io(nir_shader *shader, struct tu_device *dev,
+             struct tu_shader *tu_shader,
+@@ -3756,13 +3781,6 @@ tu_shader_create(struct tu_device *dev,
+       }
+    }
+ 
+-   struct ir3_const_allocations const_allocs = {};
+-   NIR_PASS(_, nir, tu_lower_io, dev, shader, ir3_key, layout,
+-            key->read_only_input_attachments, key->dynamic_renderpass,
+-            &const_allocs);
+-
+-   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+-
+    if (dev->physical_device->info->chip == 5) {
+       /* Record the bindful SSBO map used by tu5_dispatch(). a5xx isam/ldgb
+        * take an immediate state slot, which we define to be the Vulkan
+@@ -3772,7 +3790,7 @@ tu_shader_create(struct tu_device *dev,
+       bool has_ssbo = false;
+ 
+       nir_foreach_variable_with_modes (var, nir, nir_var_mem_ssbo) {
+-         if (var->data.descriptor_set != 0 ||
++         if (var->data.descriptor_set != 0 || var->data.binding != 0 ||
+              shader->num_ssbos >= TU5_MAX_SSBOS) {
+             vk_free(&dev->vk.alloc, shader);
+             return VK_ERROR_FEATURE_NOT_PRESENT;
+@@ -3789,6 +3807,21 @@ tu_shader_create(struct tu_device *dev,
+          nir->info.num_ssbos = max_binding + 1;
+    }
+ 
++   if (dev->physical_device->info->chip == 5) {
++      /* a5xx isam/ldgb take an immediate SSBO state slot; drop the bindless
++       * descriptor vector before the normal descriptor lowering runs.
++       */
++      NIR_PASS(_, nir, nir_shader_intrinsics_pass,
++               tu5_lower_bindful_ssbo_instr, nir_metadata_none, NULL);
++   }
++
++   struct ir3_const_allocations const_allocs = {};
++   NIR_PASS(_, nir, tu_lower_io, dev, shader, ir3_key, layout,
++            key->read_only_input_attachments, key->dynamic_renderpass,
++            &const_allocs);
++
++   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
++
+    struct ir3_shader_nir_options nir_options;
+    init_ir3_nir_options(&nir_options, key);
+ 
+@@ -4282,6 +4315,10 @@ tu_init_empty_shaders(struct tu_device *dev)
+ {
+    VkResult result;
+ 
++   /* a5xx compute MVP: no graphics stages, so no empty TCS/TES/GS/FS. */
++   if (dev->physical_device->info->chip == 5)
++      return VK_SUCCESS;
++
+    result = tu_empty_shader_create(dev, &dev->empty_tcs, MESA_SHADER_TESS_CTRL);
+    if (result != VK_SUCCESS)
+       goto out;
+@@ -4321,11 +4358,16 @@ out:
+ void
+ tu_destroy_empty_shaders(struct tu_device *dev)
+ {
+-   vk_pipeline_cache_object_unref(&dev->vk, &dev->empty_tcs->base);
+-   vk_pipeline_cache_object_unref(&dev->vk, &dev->empty_tes->base);
+-   vk_pipeline_cache_object_unref(&dev->vk, &dev->empty_gs->base);
+-   vk_pipeline_cache_object_unref(&dev->vk, &dev->empty_fs->base);
+-   vk_pipeline_cache_object_unref(&dev->vk, &dev->empty_fs_fdm->base);
++   if (dev->empty_tcs)
++      vk_pipeline_cache_object_unref(&dev->vk, &dev->empty_tcs->base);
++   if (dev->empty_tes)
++      vk_pipeline_cache_object_unref(&dev->vk, &dev->empty_tes->base);
++   if (dev->empty_gs)
++      vk_pipeline_cache_object_unref(&dev->vk, &dev->empty_gs->base);
++   if (dev->empty_fs)
++      vk_pipeline_cache_object_unref(&dev->vk, &dev->empty_fs->base);
++   if (dev->empty_fs_fdm)
++      vk_pipeline_cache_object_unref(&dev->vk, &dev->empty_fs_fdm->base);
+ }
+ 
+ void

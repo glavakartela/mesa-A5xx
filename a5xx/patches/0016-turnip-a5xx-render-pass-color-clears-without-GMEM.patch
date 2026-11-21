@@ -1,0 +1,220 @@
+From 791e8892a429e27d5f9a4763be619930128b6c6a Mon Sep 17 00:00:00 2001
+From: opencode <user@example.com>
+Date: Fri, 20 Nov 2026 12:04:22 +0200
+Subject: [PATCH 16/29] turnip/a5xx: render-pass color clears without GMEM
+
+There is no GMEM on the a5xx sysmem path, and using RB_CLEAR_CNTL fast
+clear hangs the GPU (verified: the whole phone has to be powered off).
+Instead apply loadOp=CLEAR at vkCmdBeginRenderPass time by filling the
+linear attachment memory with CP_MEM_WRITE. This is a slow fallback
+(one dword per pixel in the command stream), but it is correct and
+cannot hang the CP.
+
+While here:
+- force all non-depth chip 5 images to TILE5_LINEAR (the MRT path only
+  understands linear, and there is no UBWC), and
+- stop advertising DRM_FORMAT_MOD_QCOM_COMPRESSED on chip 5.
+
+tu5_clear_test: 4096/4096 pixels are the clear color, no draw in the
+render pass, PASS.
+---
+ src/freedreno/vulkan/tu5_graphics.cc  | 109 ++++++++++++++++++++++++++
+ src/freedreno/vulkan/tu5_graphics.h   |   5 ++
+ src/freedreno/vulkan/tu_cmd_buffer.cc |   4 +-
+ src/freedreno/vulkan/tu_formats.cc    |   6 +-
+ src/freedreno/vulkan/tu_image.cc      |   8 ++
+ 5 files changed, 129 insertions(+), 3 deletions(-)
+
+diff --git a/src/freedreno/vulkan/tu5_graphics.cc b/src/freedreno/vulkan/tu5_graphics.cc
+index 53d048d..503b14d 100644
+--- a/src/freedreno/vulkan/tu5_graphics.cc
++++ b/src/freedreno/vulkan/tu5_graphics.cc
+@@ -880,6 +880,115 @@ tu5_emit_global_state(struct tu_cmd_buffer *cmd)
+    tu5_emit_reg(cs, REG_A5XX_VPC_FS_PRIMITIVEID_CNTL, 0xff);
+ }
+ 
++/* A5xx sysmem rendering has no GMEM, so RB_CLEAR_CNTL cannot be used to
++ * clear attachments (doing so hangs the GPU). The images created by this
++ * driver are linear, so a render-pass clear can be done with a plain
++ * CP_MEM_WRITE fill of the attachment memory.
++ */
++static bool
++tu5_clear_color_dword(VkFormat format, const VkClearColorValue *color,
++                      uint32_t *out)
++{
++   float rgba[4] = {
++      color->float32[0], color->float32[1],
++      color->float32[2], color->float32[3],
++   };
++   bool srgb = false, bgra = false;
++
++   switch (format) {
++   case VK_FORMAT_R8G8B8A8_UNORM:
++      break;
++   case VK_FORMAT_R8G8B8A8_SRGB:
++      srgb = true;
++      break;
++   case VK_FORMAT_B8G8R8A8_UNORM:
++      bgra = true;
++      break;
++   case VK_FORMAT_B8G8R8A8_SRGB:
++      bgra = true;
++      srgb = true;
++      break;
++   default:
++      return false;
++   }
++
++   uint32_t c[4];
++   for (unsigned i = 0; i < 4; i++) {
++      float v = CLAMP(rgba[i], 0.0f, 1.0f);
++      if (srgb)
++         v = (v <= 0.0031308f) ? v * 12.92f
++                               : 1.055f * powf(v, 1.0f / 2.4f) - 0.055f;
++      c[i] = (uint32_t)(v * 255.0f + 0.5f);
++   }
++
++   if (bgra)
++      *out = c[2] | (c[1] << 8) | (c[0] << 16) | (c[3] << 24);
++   else
++      *out = c[0] | (c[1] << 8) | (c[2] << 16) | (c[3] << 24);
++   return true;
++}
++
++static void
++tu5_fill_linear(struct tu_cs *cs, uint64_t addr, uint64_t size, uint32_t value)
++{
++   /* CP_MEM_WRITE's packet length field is 14 bits including the address. */
++   const uint64_t chunk_size = 16380 * 4;
++
++   for (uint64_t offset = 0; offset < size; offset += chunk_size) {
++      uint64_t chunk = MIN2(size - offset, chunk_size);
++      unsigned dwords = (chunk + 3) / 4;
++
++      tu_cs_emit_pkt7(cs, CP_MEM_WRITE, 2 + dwords);
++      tu_cs_emit_qw(cs, addr + offset);
++      for (unsigned i = 0; i < dwords; i++)
++         tu_cs_emit(cs, value);
++   }
++
++   tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
++}
++
++void
++tu5_clear_attachments(struct tu_cmd_buffer *cmd)
++{
++   const struct tu_render_pass *pass = cmd->state.pass;
++
++   if (!pass)
++      return;
++
++   for (unsigned i = 0; i < MIN2(pass->user_attachment_count,
++                                 pass->attachment_count); i++) {
++      const struct tu_render_pass_attachment *att = &pass->attachments[i];
++
++      if (!(att->clear_mask & VK_IMAGE_ASPECT_COLOR_BIT))
++         continue;
++
++      const struct tu_image_view *iview = cmd->state.attachments[i];
++      if (!iview)
++         continue;
++
++      uint32_t value;
++      if (!tu5_clear_color_dword(att->format, &cmd->state.clear_values[i].color,
++                                 &value)) {
++         if (tu5_gfx_debug())
++            fprintf(stderr, "  clear: unsupported format %d, skipped\n",
++                    att->format);
++         continue;
++      }
++
++      uint32_t width = iview->image->vk.extent.width;
++      uint32_t height = iview->image->vk.extent.height;
++      (void)width;
++
++      tu5_fill_linear(&cmd->cs, iview->view.base_addr,
++                      (uint64_t)iview->view.pitch * height, value);
++
++      if (tu5_gfx_debug())
++         fprintf(stderr, "  clear: att=%u addr=0x%llx pitch=%u h=%u val=0x%08x\n",
++                 i, (unsigned long long)iview->view.base_addr,
++                 iview->view.pitch, height, value);
++   }
++}
++
+ static void
+ tu5_emit_mrt(struct tu_cmd_buffer *cmd,
+              const struct tu_image_view *iview,
+diff --git a/src/freedreno/vulkan/tu5_graphics.h b/src/freedreno/vulkan/tu5_graphics.h
+index 5452ec1..e1bb992 100644
+--- a/src/freedreno/vulkan/tu5_graphics.h
++++ b/src/freedreno/vulkan/tu5_graphics.h
+@@ -27,4 +27,9 @@ struct tu5_draw_info {
+ 
+ void tu5_draw(struct tu_cmd_buffer *cmd, const struct tu5_draw_info *info);
+ 
++/* Apply the render-pass loadOp=CLEAR for color attachments. a5xx sysmem
++ * rendering has no GMEM, so this is done with a linear memory fill.
++ */
++void tu5_clear_attachments(struct tu_cmd_buffer *cmd);
++
+ #endif /* TU5_GRAPHICS_H */
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index b46b477..6dfd567 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -7268,8 +7268,10 @@ tu_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
+ 
+    if (cmd->device->physical_device->info->chip == 5) {
+       /* Minimal sysmem renderpass: attachment pointers and clear values are
+-       * enough, the actual a5xx state is emitted by tu5_draw.
++       * enough, the actual a5xx state is emitted by tu5_draw. Clears are
++       * applied here, since there is no GMEM to do the load op later.
+        */
++      tu5_clear_attachments(cmd);
+       return;
+    }
+ 
+diff --git a/src/freedreno/vulkan/tu_formats.cc b/src/freedreno/vulkan/tu_formats.cc
+index 484035a..f1cea9f 100644
+--- a/src/freedreno/vulkan/tu_formats.cc
++++ b/src/freedreno/vulkan/tu_formats.cc
+@@ -430,7 +430,8 @@ tu_GetPhysicalDeviceFormatProperties2(
+       }
+ 
+       /* note: ubwc_possible() argument values to be ignored except for format */
+-      if (pFormatProperties->formatProperties.optimalTilingFeatures &&
++      if (physical_device->info->chip != 5 &&
++          pFormatProperties->formatProperties.optimalTilingFeatures &&
+           tiling_possible(format) &&
+           ubwc_possible(NULL, format, VK_IMAGE_TYPE_2D, 0, 0, 0,
+                         physical_device->info, VK_SAMPLE_COUNT_1_BIT, 1,
+@@ -461,7 +462,8 @@ tu_GetPhysicalDeviceFormatProperties2(
+       }
+ 
+       /* note: ubwc_possible() argument values to be ignored except for format */
+-      if (props3->optimalTilingFeatures &&
++      if (physical_device->info->chip != 5 &&
++          props3->optimalTilingFeatures &&
+           tiling_possible(format) &&
+           ubwc_possible(NULL, format, VK_IMAGE_TYPE_2D, 0, 0, 0,
+                         physical_device->info, VK_SAMPLE_COUNT_1_BIT, 1,
+diff --git a/src/freedreno/vulkan/tu_image.cc b/src/freedreno/vulkan/tu_image.cc
+index 478a63b..568dba9 100644
+--- a/src/freedreno/vulkan/tu_image.cc
++++ b/src/freedreno/vulkan/tu_image.cc
+@@ -566,6 +566,14 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
+       force_linear_tile = true;
+    }
+ 
++   /* The a5xx sysmem path only understands linear images: its MRT/texture
++    * descriptors use TILE5_LINEAR and there is no UBWC support.
++    */
++   if (device->physical_device->info->chip == 5 && !plane_layouts) {
++      force_linear_tile = true;
++      ubwc_enabled = false;
++   }
++
+    /* Force linear tiling for HIC usage with swapped formats. Because tiled
+     * images are stored without the swap, we would have to apply the swap when
+     * copying on the CPU, which for some formats is tricky.

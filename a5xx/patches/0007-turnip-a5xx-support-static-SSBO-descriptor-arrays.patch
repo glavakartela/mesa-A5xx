@@ -1,0 +1,86 @@
+From 0a8139329927faf3a1720d402da82c3b4be3199b Mon Sep 17 00:00:00 2001
+From: local <local@local>
+Date: Thu, 19 Nov 2026 22:21:37 +0200
+Subject: [PATCH 07/29] turnip/a5xx: support static SSBO descriptor arrays
+
+Resolve the bindful slot as binding + constant array index and upload each
+array element's compact SSBO descriptor to its flat A5XX_SSBO slot.
+Dynamic array indices are left unsupported for now.
+
+Not hardware-tested.
+---
+ src/freedreno/vulkan/tu5_compute.cc | 11 ++++++++---
+ src/freedreno/vulkan/tu_shader.cc   | 23 ++++++++++++++++-------
+ 2 files changed, 24 insertions(+), 10 deletions(-)
+
+diff --git a/src/freedreno/vulkan/tu5_compute.cc b/src/freedreno/vulkan/tu5_compute.cc
+index cd6ca68..4c9331b 100644
+--- a/src/freedreno/vulkan/tu5_compute.cc
++++ b/src/freedreno/vulkan/tu5_compute.cc
+@@ -224,9 +224,14 @@ tu5_emit_ssbo_state(struct tu_cmd_buffer *cmd)
+       if (bl->type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
+          continue;
+ 
+-      const uint32_t *desc = dset->mapped_ptr + bl->offset / 4;
+-      addrs[binding] = desc[0] | ((uint64_t)desc[1] << 32);
+-      sizes[binding] = desc[2];
++      unsigned array_size = MAX2(bl->array_size, 1);
++      for (unsigned e = 0; e < array_size && binding + e < TU5_MAX_SSBOS; e++) {
++         const uint32_t *desc = dset->mapped_ptr + bl->offset / 4 +
++                                e * bl->size / 4;
++         addrs[binding + e] = desc[0] | ((uint64_t)desc[1] << 32);
++         sizes[binding + e] = desc[2];
++         max_binding = MAX2(max_binding, binding + e);
++      }
+    }
+ 
+    unsigned count = max_binding + 1;
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index 67cefe9..ae60a2d 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -1533,7 +1533,7 @@ shader_uses_push_consts(nir_shader *shader)
+ }
+ 
+ static bool
+-tu5_trace_desc_binding(nir_def *def, unsigned *binding)
++tu5_trace_desc_binding(nir_def *def, unsigned *slot)
+ {
+    nir_instr *instr = nir_def_instr(def);
+ 
+@@ -1542,12 +1542,21 @@ tu5_trace_desc_binding(nir_def *def, unsigned *binding)
+       nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+       switch (intr->intrinsic) {
+       case nir_intrinsic_load_vulkan_descriptor:
+-         return tu5_trace_desc_binding(intr->src[0].ssa, binding);
+-      case nir_intrinsic_vulkan_resource_index:
+-         *binding = nir_intrinsic_binding(intr);
++         return tu5_trace_desc_binding(intr->src[0].ssa, slot);
++      case nir_intrinsic_vulkan_resource_index: {
++         if (!nir_src_is_const(intr->src[0]))
++            return false;
++         *slot = nir_intrinsic_binding(intr) + nir_src_as_uint(intr->src[0]);
+          return true;
+-      case nir_intrinsic_vulkan_resource_reindex:
+-         return tu5_trace_desc_binding(intr->src[0].ssa, binding);
++      }
++      case nir_intrinsic_vulkan_resource_reindex: {
++         unsigned base;
++         if (!tu5_trace_desc_binding(intr->src[0].ssa, &base) ||
++             !nir_src_is_const(intr->src[1]))
++            return false;
++         *slot = base + nir_src_as_uint(intr->src[1]);
++         return true;
++      }
+       default:
+          return false;
+       }
+@@ -1555,7 +1564,7 @@ tu5_trace_desc_binding(nir_def *def, unsigned *binding)
+    case nir_instr_type_alu: {
+       nir_alu_instr *alu = nir_instr_as_alu(instr);
+       for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
+-         if (tu5_trace_desc_binding(alu->src[i].src.ssa, binding))
++         if (tu5_trace_desc_binding(alu->src[i].src.ssa, slot))
+             return true;
+       }
+       return false;

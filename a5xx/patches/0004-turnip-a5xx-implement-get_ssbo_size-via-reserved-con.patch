@@ -1,0 +1,127 @@
+From 722098d35ccd312e9613e291e1ee0580e40df859 Mon Sep 17 00:00:00 2001
+From: local <local@local>
+Date: Thu, 19 Nov 2026 21:31:52 +0200
+Subject: [PATCH 04/29] turnip/a5xx: implement get_ssbo_size via reserved
+ consts
+
+RESINFO does not return the SSBO size for our A5XX_SSBO state, so reserve a
+const range per shader, lower get_ssbo_size() to a const load, and upload the
+per-slot sizes (in bytes) on every dispatch.
+
+The storage-buffer smoke test now uses .length() and passes 512/512.
+
+Generated-by: LLM
+---
+ src/freedreno/ir3/ir3_shader.h      |  4 +++-
+ src/freedreno/vulkan/tu5_compute.cc | 21 +++++++++++++++++
+ src/freedreno/vulkan/tu_shader.cc   | 36 +++++++++++++++++++++++++++++
+ 3 files changed, 60 insertions(+), 1 deletion(-)
+
+diff --git a/src/freedreno/ir3/ir3_shader.h b/src/freedreno/ir3/ir3_shader.h
+index 87571bf..6cb824e 100644
+--- a/src/freedreno/ir3/ir3_shader.h
++++ b/src/freedreno/ir3/ir3_shader.h
+@@ -234,7 +234,9 @@ enum ir3_const_alloc_type {
+    IR3_CONST_ALLOC_PRIMITIVE_MAP = 11,
+    /* For SSBO emulation */
+    IR3_CONST_ALLOC_BINDLESS_BASE_ADDRS = 12,
+-   IR3_CONST_ALLOC_MAX = 13,
++   /* a5xx: per-slot SSBO sizes in bytes for get_ssbo_size() */
++   IR3_CONST_ALLOC_SSBO_SIZES = 13,
++   IR3_CONST_ALLOC_MAX = 14,
+ };
+ 
+ struct ir3_const_allocation {
+diff --git a/src/freedreno/vulkan/tu5_compute.cc b/src/freedreno/vulkan/tu5_compute.cc
+index 1165952..cc4210f 100644
+--- a/src/freedreno/vulkan/tu5_compute.cc
++++ b/src/freedreno/vulkan/tu5_compute.cc
+@@ -257,6 +257,27 @@ tu5_emit_ssbo_state(struct tu_cmd_buffer *cmd)
+    tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
+    for (unsigned i = 0; i < count; i++)
+       tu_cs_emit_qw(&cmd->cs, addrs[i]);
++   /* a5xx get_ssbo_size() is lowered to a const load: upload per-slot sizes
++    * (in bytes) into the reserved const range.
++    */
++   const struct ir3_shader_variant *v = shader->variant;
++   if (ir3_const_can_upload(&v->const_state->allocs,
++                            IR3_CONST_ALLOC_SSBO_SIZES, v->constlen)) {
++      uint32_t off =
++         v->const_state->allocs.consts[IR3_CONST_ALLOC_SSBO_SIZES].offset_vec4;
++      unsigned units = DIV_ROUND_UP(TU5_MAX_SSBOS, 4);
++
++      tu_cs_emit_pkt7(&cmd->cs, CP_LOAD_STATE4, 3 + units * 4);
++      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_0_DST_OFF(off) |
++                               CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
++                               CP_LOAD_STATE4_0_STATE_BLOCK(SB4_CS_SHADER) |
++                               CP_LOAD_STATE4_0_NUM_UNIT(units));
++      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
++                               CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
++      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
++      for (unsigned i = 0; i < units * 4; i++)
++         tu_cs_emit(&cmd->cs, i < TU5_MAX_SSBOS ? sizes[i] * 4 : 0);
++   }
+ }
+ 
+ void
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index 82c32e3..6091e38 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -1597,6 +1597,30 @@ tu5_lower_bindful_ssbo_instr(nir_builder *b, nir_instr *instr, void *data)
+    return true;
+ }
+ 
++static bool
++tu5_lower_ssbo_size_instr(nir_builder *b, nir_instr *instr, void *data)
++{
++   if (instr->type != nir_instr_type_intrinsic)
++      return false;
++
++   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++   if (intr->intrinsic != nir_intrinsic_get_ssbo_size)
++      return false;
++
++   unsigned binding = 0;
++   if (nir_src_is_const(intr->src[0]))
++      binding = nir_src_as_uint(intr->src[0]);
++   if (binding >= TU5_MAX_SSBOS)
++      return false;
++
++   uint32_t base = *(const uint32_t *)data + binding;
++   nir_builder b_at = nir_builder_at(nir_before_instr(instr));
++   nir_def *size = nir_load_const_ir3(&b_at, 1, 32,
++                                      nir_imm_int(&b_at, 0), .base = base);
++   nir_def_replace(&intr->def, size);
++   return true;
++}
++
+ static bool
+ tu_lower_io(nir_shader *shader, struct tu_device *dev,
+             struct tu_shader *tu_shader,
+@@ -1657,6 +1681,11 @@ tu_lower_io(nir_shader *shader, struct tu_device *dev,
+                       push_consts_vec4, offset_align_vec4);
+    }
+ 
++   if (dev->physical_device->info->chip == 5) {
++      ir3_const_alloc(const_allocs, IR3_CONST_ALLOC_SSBO_SIZES,
++                      DIV_ROUND_UP(TU5_MAX_SSBOS, 4), 1);
++   }
++
+    bool unknown_dynamic_size = false;
+    bool unknown_dynamic_offset = false;
+    for (unsigned i = 0; i < layout->num_sets; i++) {
+@@ -3868,6 +3897,13 @@ tu_shader_create(struct tu_device *dev,
+             key->read_only_input_attachments, key->dynamic_renderpass,
+             &const_allocs);
+ 
++   if (dev->physical_device->info->chip == 5) {
++      uint32_t size_base =
++         const_allocs.consts[IR3_CONST_ALLOC_SSBO_SIZES].offset_vec4 * 4;
++      NIR_PASS(_, nir, nir_shader_instructions_pass,
++               tu5_lower_ssbo_size_instr, nir_metadata_none, &size_base);
++   }
++
+    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+ 
+    struct ir3_shader_nir_options nir_options;

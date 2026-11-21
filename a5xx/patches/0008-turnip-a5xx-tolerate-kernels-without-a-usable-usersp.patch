@@ -1,0 +1,30 @@
+From 8d66cdec74b82cea45a4b932b612b60fc1b6774f Mon Sep 17 00:00:00 2001
+From: local <local@local>
+Date: Thu, 19 Nov 2026 22:29:29 +0200
+Subject: [PATCH 08/29] turnip/a5xx: tolerate kernels without a usable
+ userspace VA range
+
+Older whyred kernels can report set_iova but a zero/too-small VA size,
+which makes util_vma_heap_validate() crash during device creation. Fall
+back to kernel-assigned IOVAs in that case.
+---
+ src/freedreno/vulkan/tu_knl_drm_msm.cc | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/freedreno/vulkan/tu_knl_drm_msm.cc b/src/freedreno/vulkan/tu_knl_drm_msm.cc
+index fe0ec29..0f4404b 100644
+--- a/src/freedreno/vulkan/tu_knl_drm_msm.cc
++++ b/src/freedreno/vulkan/tu_knl_drm_msm.cc
+@@ -1399,6 +1399,12 @@ tu_knl_drm_msm_load(struct tu_instance *instance,
+    device->gmem_base = val;
+ 
+    device->has_set_iova = !msm_common_get_va_prop(device->local_fd, MSM_PIPE_3D0, &device->va_start, &device->va_size);
++   /* Some older kernels report VA props but with a zero/too-small range. */
++   if (device->has_set_iova && device->va_size < 0x100000) {
++      device->has_set_iova = false;
++      device->va_start = 0;
++      device->va_size = 0;
++   }
+    device->has_iova_align = device->has_set_iova;
+    device->has_lazy_bos = device->has_set_iova;
+    device->has_raytracing = tu_drm_get_param_or(fd, MSM_PARAM_RAYTRACING, &val, false);
