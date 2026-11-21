@@ -1075,30 +1075,13 @@ lower_tex_texel_buffer_to_image(
  * the TPL1 texture/sampler slot and drop the descriptor deref sources. The
  * driver emits TPL1 state for those slots at draw time.
  */
-/* a5xx's texture unit returns half-precision values.  A highp Vulkan
- * shader would otherwise get a "sam (f32)" instruction, which is unreliable
- * on this generation (observed as zero samples and GPU hangs).  Force the
- * texture result to f16 and convert back to f32, matching what fd5 does for
- * mediump shaders.
+/* NOTE: a5xx texture sampling must stay f32.  An earlier workaround forced
+ * every float texture result to f16 ("sam (f16)" + cov.f16f32) on the theory
+ * that f32 sampling was unreliable, but on SDM636/a509 the f16 sample path
+ * returns zeros every frame (black vkcube) and is accompanied by TPL1
+ * translation faults at IOVA 0.  f32 "sam" renders correctly, so the lowering
+ * was removed.  See opencode/GPU-TEXTURE-F16-2026-11-21.md.
  */
-static bool
-tu5_lower_tex_to_f16(nir_builder *b, nir_instr *instr, void *data)
-{
-   if (instr->type != nir_instr_type_tex)
-      return false;
-
-   nir_tex_instr *tex = nir_instr_as_tex(instr);
-   if (tex->dest_type != nir_type_float32)
-      return false;
-
-   tex->def.bit_size = 16;
-   tex->dest_type = nir_type_float16;
-
-   b->cursor = nir_after_instr(&tex->instr);
-   nir_def *cvt = nir_f2f32(b, &tex->def);
-   nir_def_rewrite_uses_after(&tex->def, cvt);
-   return true;
-}
 
 static bool
 tu5_lower_bindful_tex(nir_tex_instr *tex, struct tu_shader *shader, bool ref)
@@ -4042,11 +4025,6 @@ tu_shader_create(struct tu_device *dev,
    NIR_PASS(_, nir, tu_lower_io, dev, shader, ir3_key, layout,
             key->read_only_input_attachments, key->dynamic_renderpass,
             &const_allocs);
-
-   if (dev->physical_device->info->chip == 5) {
-      NIR_PASS(_, nir, nir_shader_instructions_pass,
-               tu5_lower_tex_to_f16, nir_metadata_none, NULL);
-   }
 
    if (dev->physical_device->info->chip == 5) {
       uint32_t size_base =
