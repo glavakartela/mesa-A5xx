@@ -18,7 +18,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "tu_buffer.h"
 #include "tu_cmd_buffer.h"
+#include "tu_knl.h"
 #include "tu_image.h"
 #include "tu_sampler.h"
 #include "tu_shader.h"
@@ -124,6 +126,8 @@ tu5_format(VkFormat format, bool *srgb, bool *sint, bool *uint_format)
       return A5EN_RB5_R32_SINT;
    case VK_FORMAT_R32_SFLOAT:
       return A5EN_RB5_R32_FLOAT;
+   case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
+      return A5EN_RB5_R10G10B10A2_UNORM;
    default:
       return 0;
    }
@@ -135,6 +139,7 @@ tu5_format_swap(VkFormat format)
    switch (format) {
    case VK_FORMAT_B8G8R8A8_UNORM:
    case VK_FORMAT_B8G8R8A8_SRGB:
+   case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
       return WXYZ;
    default:
       return WZYX;
@@ -645,6 +650,10 @@ tu5_emit_vs_driver_params(struct tu_cmd_buffer *cmd,
    if (!size)
       return;
 
+   if (getenv("TU5_GFX_DEBUG"))
+      fprintf(stderr, "tu5 vs params: offset=%u vec4, size=%u dwords, struct=%zu dwords, constlen=%u\n",
+              offset, size, sizeof(struct ir3_driver_params_vs) / 4, v->constlen);
+
    struct ir3_driver_params_vs p = {
       .draw_id = 0,
       .vtxid_base = info->indexed ? (uint32_t)info->vertex_offset
@@ -802,6 +811,9 @@ tu5_emit_gfx_ssbo_state(struct tu_cmd_buffer *cmd,
    if (!shader->num_ssbos)
       return;
 
+   if (getenv("TU5_GFX_DEBUG"))
+      fprintf(stderr, "tu5 ssbo state: num_ssbos=%u\n", shader->num_ssbos);
+
    struct tu_descriptor_state *ds =
       tu_get_descriptors_state(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
    uint64_t addrs[TU5_MAX_SSBOS] = {};
@@ -876,6 +888,117 @@ tu5_emit_gfx_ssbo_state(struct tu_cmd_buffer *cmd,
       tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
       for (unsigned i = 0; i < units * 4; i++)
          tu_cs_emit(&cmd->cs, i < TU5_MAX_SSBOS ? sizes[i] * 4 : 0);
+   }
+}
+
+static uint64_t
+tu5_get_gfx_ubo_addr(struct tu_cmd_buffer *cmd, unsigned binding)
+{
+   struct tu_descriptor_state *ds =
+      tu_get_descriptors_state(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+   struct tu_descriptor_set *dset = ds->sets[0];
+
+   if (!dset || binding >= dset->layout->binding_count || !dset->mapped_ptr)
+      return 0;
+
+   const struct tu_descriptor_set_binding_layout *bl =
+      &dset->layout->binding[binding];
+   if (bl->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
+       bl->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)
+      return 0;
+
+   const uint32_t *desc = dset->mapped_ptr + bl->offset / 4;
+   uint64_t addr = desc[0] | ((uint64_t)(desc[1] & 0x1ffff) << 32);
+   uint32_t dyn = 0;
+   if (bl->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC &&
+       dset->dynamic_descriptors) {
+      dyn = dset->dynamic_descriptors[bl->dynamic_offset_offset / 4];
+      addr += dyn;
+   }
+   if (getenv("TU5_GFX_DEBUG")) {
+      fprintf(stderr, "tu5 ubo binding=%u type=%u addr=%llx size=%u dyn=%u\n",
+              binding, bl->type, (unsigned long long)addr, desc[2], dyn);
+   }
+   return addr;
+}
+
+static void
+tu5_emit_gfx_ubo_state(struct tu_cmd_buffer *cmd,
+                       struct tu_shader *shader,
+                       enum a4xx_state_block shader_sb)
+{
+   if (!shader || !shader->num_ubos)
+      return;
+
+   const struct ir3_shader_variant *v = shader->variant;
+   const struct ir3_const_allocations *allocs = &v->const_state->allocs;
+
+   if (getenv("TU5_GFX_DEBUG")) {
+      fprintf(stderr, "tu5 ubo state: stage=%u num_ubos=%u constlen=%u base=%u can=%d\n",
+              v->type, shader->num_ubos, v->constlen,
+              allocs->consts[IR3_CONST_ALLOC_UBO_PTRS].offset_vec4 * 4,
+              ir3_const_can_upload(allocs, IR3_CONST_ALLOC_UBO_PTRS, v->constlen));
+      fprintf(stderr, "  driver params at vec4 %u, ssbo sizes at vec4 %u\n",
+              allocs->consts[IR3_CONST_ALLOC_DRIVER_PARAMS].offset_vec4,
+              allocs->consts[IR3_CONST_ALLOC_SSBO_SIZES].offset_vec4);
+   }
+
+   /* a5xx UBO loads are lowered to global loads through pointers stored in
+    * const state. Without uploading them the shader dereferences garbage
+    * (usually 0) and the GPU hangs.
+    */
+   if (ir3_const_can_upload(allocs, IR3_CONST_ALLOC_UBO_PTRS, v->constlen)) {
+      uint32_t off = allocs->consts[IR3_CONST_ALLOC_UBO_PTRS].offset_vec4;
+      unsigned slots = MAX2((unsigned)shader->num_ubos,
+                            v->const_state->num_ubos);
+      unsigned units = DIV_ROUND_UP(slots * 2, 4);
+
+      tu_cs_emit_pkt7(&cmd->cs, CP_LOAD_STATE4, 3 + units * 4);
+      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_0_DST_OFF(off) |
+                               CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
+                               CP_LOAD_STATE4_0_STATE_BLOCK(shader_sb) |
+                               CP_LOAD_STATE4_0_NUM_UNIT(units));
+      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
+                               CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
+      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
+
+      for (unsigned i = 0; i < units * 4; i++) {
+         unsigned slot = i / 2;
+         uint32_t addr_lo = 0, addr_hi = 0;
+         if (slot < shader->num_ubos) {
+            uint64_t addr =
+               tu5_get_gfx_ubo_addr(cmd, shader->ubo_map[slot].binding);
+            addr_lo = addr;
+            addr_hi = addr >> 32;
+         }
+         tu_cs_emit(&cmd->cs, (i & 1) ? addr_hi : addr_lo);
+      }
+   }
+
+   const struct ir3_ubo_analysis_state *state = &v->const_state->ubo_state;
+   for (unsigned i = 0; i < state->num_enabled; i++) {
+      const struct ir3_ubo_range *r = &state->range[i];
+      uint32_t size = r->end - r->start;
+      if (!size || !ir3_const_can_upload(allocs, IR3_CONST_ALLOC_UBO_RANGES,
+                                         v->constlen))
+         continue;
+
+      uint64_t addr = tu5_get_gfx_ubo_addr(cmd, r->ubo.block);
+      if (!addr)
+         continue;
+
+      unsigned units = size / 16;
+      if (!units)
+         continue;
+
+      tu_cs_emit_pkt7(&cmd->cs, CP_LOAD_STATE4, 3);
+      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_0_DST_OFF(r->offset / 16) |
+                               CP_LOAD_STATE4_0_STATE_SRC(SS4_INDIRECT) |
+                               CP_LOAD_STATE4_0_STATE_BLOCK(shader_sb) |
+                               CP_LOAD_STATE4_0_NUM_UNIT(units));
+      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
+                               CP_LOAD_STATE4_1_EXT_SRC_ADDR((uint32_t)(addr + r->start)));
+      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI((addr + r->start) >> 32));
    }
 }
 
@@ -962,6 +1085,15 @@ tu5_clear_color_dword(VkFormat format, const VkClearColorValue *color,
       bgra = true;
       srgb = true;
       break;
+   case VK_FORMAT_A2R10G10B10_UNORM_PACK32: {
+      /* A2R10G10B10: A in bits 31:30, R 29:20, G 19:10, B 9:0. */
+      uint32_t r = (uint32_t)(CLAMP(rgba[0], 0.0f, 1.0f) * 1023.0f + 0.5f);
+      uint32_t g = (uint32_t)(CLAMP(rgba[1], 0.0f, 1.0f) * 1023.0f + 0.5f);
+      uint32_t b = (uint32_t)(CLAMP(rgba[2], 0.0f, 1.0f) * 1023.0f + 0.5f);
+      uint32_t a = (uint32_t)(CLAMP(rgba[3], 0.0f, 1.0f) * 3.0f + 0.5f);
+      *out = b | (g << 10) | (r << 20) | (a << 30);
+      return true;
+   }
    default:
       return false;
    }
@@ -1039,6 +1171,13 @@ tu5_clear_depth_dword(VkFormat format, float depth, uint32_t stencil,
    }
 }
 
+static uint64_t
+tu5_ds_clear_size(const struct fdl6_view *view, uint64_t height)
+{
+   uint64_t linear = (uint64_t)view->pitch * height;
+   return view->layer_size > linear ? view->layer_size : linear;
+}
+
 static void
 tu5_clear_ds_attachment(struct tu_cmd_buffer *cmd, unsigned idx,
                         const struct tu_render_pass_attachment *att,
@@ -1070,7 +1209,7 @@ tu5_clear_ds_attachment(struct tu_cmd_buffer *cmd, unsigned idx,
                        " h=%" PRIu64 " val=%08x\n", dview->base_addr,
                        dview->pitch, height, value);
             tu5_fill_linear(&cmd->cs, dview->base_addr,
-                            (uint64_t)dview->pitch * height, value);
+                            tu5_ds_clear_size(dview, height), value);
          }
       } else if (clear_depth || clear_stencil) {
          if (!att->load) {
@@ -1078,7 +1217,7 @@ tu5_clear_ds_attachment(struct tu_cmd_buffer *cmd, unsigned idx,
             if (tu5_clear_depth_dword(format, depth, stencil,
                                       clear_stencil, &value))
                tu5_fill_linear(&cmd->cs, dview->base_addr,
-                               (uint64_t)dview->pitch * height, value);
+                               tu5_ds_clear_size(dview, height), value);
          } else if (tu5_gfx_debug()) {
             fprintf(stderr, "  clear: D24S8 %s-only clear would clobber the "
                             "other aspect, skipped\n",
@@ -1088,11 +1227,16 @@ tu5_clear_ds_attachment(struct tu_cmd_buffer *cmd, unsigned idx,
       return;
    }
 
+   if (tu5_gfx_debug())
+      fprintf(stderr, "  clear ds: vkfmt=%d depth=%d stencil=%d value=%f base=%" PRIx64 " pitch=%u layer=%u\n",
+              format, clear_depth, clear_stencil, depth, dview->base_addr,
+              dview->pitch, dview->layer_size);
+
    if (clear_depth) {
       uint32_t value;
       if (tu5_clear_depth_dword(format, depth, 0, false, &value))
          tu5_fill_linear(&cmd->cs, dview->base_addr,
-                         (uint64_t)dview->pitch * height, value);
+                         tu5_ds_clear_size(dview, height), value);
       else if (tu5_gfx_debug())
          fprintf(stderr, "  clear: unsupported depth format %d, skipped\n",
                  format);
@@ -1109,7 +1253,7 @@ tu5_clear_ds_attachment(struct tu_cmd_buffer *cmd, unsigned idx,
       } else {
          uint32_t value = (stencil & 0xff) * 0x01010101u;
          tu5_fill_linear(&cmd->cs, sview->base_addr,
-                         (uint64_t)sview->pitch * height, value);
+                         tu5_ds_clear_size(sview, height), value);
       }
    }
 }
@@ -1625,11 +1769,13 @@ tu5_emit_zs(struct tu_cmd_buffer *cmd,
 
    uint32_t depth_cntl =
       A5XX_RB_DEPTH_CNTL_ZFUNC(dyn->ds.depth.compare_op);
-   if (dyn->ds.depth.test_enable)
-      depth_cntl |= A5XX_RB_DEPTH_CNTL_Z_TEST_ENABLE |
-                    A5XX_RB_DEPTH_CNTL_Z_READ_ENABLE;
-   if (dyn->ds.depth.write_enable)
-      depth_cntl |= A5XX_RB_DEPTH_CNTL_Z_WRITE_ENABLE;
+   if (!getenv("TU5_GFX_NODEPTH")) {
+      if (dyn->ds.depth.test_enable)
+         depth_cntl |= A5XX_RB_DEPTH_CNTL_Z_TEST_ENABLE |
+                       A5XX_RB_DEPTH_CNTL_Z_READ_ENABLE;
+      if (dyn->ds.depth.write_enable)
+         depth_cntl |= A5XX_RB_DEPTH_CNTL_Z_WRITE_ENABLE;
+   }
    tu5_emit_reg(cs, REG_A5XX_RB_DEPTH_CNTL, depth_cntl);
 
    bool fragz = fs->writes_pos;
@@ -1959,6 +2105,8 @@ tu5_draw(struct tu_cmd_buffer *cmd, const struct tu5_draw_info *info)
    tu5_emit_vs_driver_params(cmd, vs_shader, info);
    tu5_emit_gfx_ssbo_state(cmd, vs_shader, SB4_VS_SHADER);
    tu5_emit_gfx_ssbo_state(cmd, fs_shader, SB4_FS_SHADER);
+   tu5_emit_gfx_ubo_state(cmd, vs_shader, SB4_VS_SHADER);
+   tu5_emit_gfx_ubo_state(cmd, fs_shader, SB4_FS_SHADER);
    tu5_emit_textures(cmd, vs_shader, SB4_VS_TEX);
    tu5_emit_textures(cmd, fs_shader, SB4_FS_TEX);
    tu5_emit_reg(cs, REG_A5XX_TPL1_VS_TEX_COUNT, vs_shader->num_textures);
@@ -2011,6 +2159,11 @@ tu5_draw(struct tu_cmd_buffer *cmd, const struct tu5_draw_info *info)
                         CP_DRAW_INDX_OFFSET_0_VIS_CULL(vismode);
 
    if (info->indexed) {
+      if (getenv("TU5_GFX_DEBUG"))
+         fprintf(stderr, "tu5: indexed draw count=%u first=%u voff=%d inst=%u va=%" PRIx64 " max=%u size=%u\n",
+                 info->index_count, info->first_index, info->vertex_offset,
+                 info->instance_count, cmd->state.index_va,
+                 cmd->state.max_index_count, cmd->state.index_size);
       enum a4xx_index_size index_size;
       switch (cmd->state.index_size) {
       case 1: index_size = INDEX4_SIZE_8_BIT; break;
@@ -2055,4 +2208,152 @@ tu5_draw(struct tu_cmd_buffer *cmd, const struct tu5_draw_info *info)
 
    if (getenv("TU5_GFX_DUMPCS"))
       tu5_dump_cs(cmd);
+}
+
+/* a5xx hardware index fetch through CP_DRAW_INDX_OFFSET(DMA) does not work in
+ * our sysmem/bypass path. Expand the indexed draw on the CPU: build a small
+ * temporary vertex buffer with vertices in index order and issue a regular
+ * non-indexed draw. This is enough for triangle-list style content (vkcube).
+ */
+
+void
+tu5_draw_indexed(struct tu_cmd_buffer *cmd, const struct tu5_draw_info *info)
+{
+   struct tu5_draw_info local = *info;
+   info = &local;
+
+   if (!info->indexed || !cmd->state.index_buffer || info->instance_count != 1) {
+      tu5_draw(cmd, info);
+      return;
+   }
+
+   struct tu_buffer *ibuf = cmd->state.index_buffer;
+   if (tu_bo_map(cmd->device, ibuf->bo, NULL) != VK_SUCCESS) {
+      tu5_draw(cmd, info);
+      return;
+   }
+
+   unsigned index_bytes;
+   switch (cmd->state.index_size) {
+   case INDEX4_SIZE_8_BIT:
+      index_bytes = 1;
+      break;
+   case INDEX4_SIZE_16_BIT:
+      index_bytes = 2;
+      break;
+   case INDEX4_SIZE_32_BIT:
+      index_bytes = 4;
+      break;
+   default:
+      tu5_draw(cmd, info);
+      return;
+   }
+
+   if (cmd->state.index_va < ibuf->bo->iova ||
+       cmd->state.index_va - ibuf->bo->iova >= ibuf->bo->size) {
+      tu5_draw(cmd, info);
+      return;
+   }
+
+   const uint8_t *idx = (const uint8_t *)ibuf->bo->map +
+      (cmd->state.index_va - ibuf->bo->iova) +
+      (size_t)info->first_index * index_bytes;
+
+   struct tu_cs_memory tmp[MAX_VBS] = {};
+   bool any = false;
+
+   for (unsigned b = 0; b < cmd->state.max_vbs_bound; b++) {
+      struct tu_buffer *vb = cmd->state.vb_buffer[b];
+      if (!vb || !cmd->state.vb[b].size)
+         continue;
+
+      unsigned stride = cmd->state.vi.bindings[b].stride;
+      if (!stride)
+         continue;
+
+      if (tu_bo_map(cmd->device, vb->bo, NULL) != VK_SUCCESS) {
+         tu5_draw(cmd, info);
+         return;
+      }
+
+      uint64_t size = (uint64_t)info->index_count * stride;
+      if (!size || size > 4 * 1024 * 1024) {
+         tu5_draw(cmd, info);
+         return;
+      }
+
+      if (tu_cs_alloc(&cmd->sub_cs, size, 16, &tmp[b]) != VK_SUCCESS) {
+         tu5_draw(cmd, info);
+         return;
+      }
+
+      uint64_t vb_off = cmd->state.vb[b].base - vb->bo->iova;
+      const uint8_t *src = (const uint8_t *)vb->bo->map + vb_off;
+
+      for (unsigned i = 0; i < info->index_count; i++) {
+         uint32_t index;
+         if (index_bytes == 1)
+            index = idx[i];
+         else if (index_bytes == 2)
+            index = ((const uint16_t *)idx)[i];
+         else
+            index = ((const uint32_t *)idx)[i];
+
+         index += info->vertex_offset;
+         if ((uint64_t)index * stride + stride > cmd->state.vb[b].size)
+            continue;
+
+         memcpy((uint8_t *)tmp[b].map + (uint64_t)i * stride,
+                src + (uint64_t)index * stride, stride);
+      }
+
+      any = true;
+   }
+
+   if (!any) {
+      if (getenv("TU5_GFX_DEBUG"))
+         fprintf(stderr, "tu5 indexed: no expandable bindings (count=%u max_vbs=%u)\n",
+                 info->index_count, cmd->state.max_vbs_bound);
+      tu5_draw(cmd, info);
+      return;
+   }
+
+   if (getenv("TU5_GFX_DEBUG")) {
+      fprintf(stderr, "tu5 indexed expand: count=%u max_vbs=%u\n",
+              info->index_count, cmd->state.max_vbs_bound);
+      for (unsigned b = 0; b < cmd->state.max_vbs_bound; b++) {
+         if (tmp[b].map)
+            fprintf(stderr, "  binding %u: stride=%u size=%llu -> tmp %llx\n",
+                    b, cmd->state.vi.bindings[b].stride,
+                    (unsigned long long)cmd->state.vb[b].size,
+                    (unsigned long long)tmp[b].iova);
+      }
+   }
+
+   uint64_t old_base[MAX_VBS] = {};
+   uint32_t old_size[MAX_VBS] = {};
+
+   for (unsigned b = 0; b < cmd->state.max_vbs_bound; b++) {
+      if (!tmp[b].map)
+         continue;
+      old_base[b] = cmd->state.vb[b].base;
+      old_size[b] = cmd->state.vb[b].size;
+      cmd->state.vb[b].base = tmp[b].iova;
+      cmd->state.vb[b].size =
+         (uint64_t)info->index_count * cmd->state.vi.bindings[b].stride;
+   }
+
+   struct tu5_draw_info nonindexed = *info;
+   nonindexed.indexed = false;
+   nonindexed.vertex_count = info->index_count;
+   nonindexed.first_vertex = 0;
+   nonindexed.vertex_offset = 0;
+   tu5_draw(cmd, &nonindexed);
+
+   for (unsigned b = 0; b < cmd->state.max_vbs_bound; b++) {
+      if (!tmp[b].map)
+         continue;
+      cmd->state.vb[b].base = old_base[b];
+      cmd->state.vb[b].size = old_size[b];
+   }
 }

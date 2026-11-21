@@ -4048,6 +4048,16 @@ tu_MapMemory2KHR(VkDevice _device, const VkMemoryMapInfoKHR *pMemoryMapInfo, voi
    if (result != VK_SUCCESS)
       return result;
 
+   /* The a5xx memory type is advertised as HOST_COHERENT, but the CPU cache
+    * still has to be invalidated when the GPU may have written the BO.
+    * Do it on map/unmap so applications do not have to remember to call
+    * vkInvalidateMappedMemoryRanges/vkFlushMappedMemoryRanges for direct
+    * image/staging writes.
+    */
+   if (device->physical_device->has_cached_non_coherent_memory)
+      tu_bo_sync_cache(device, mem->bo, pMemoryMapInfo->offset,
+                       pMemoryMapInfo->size, TU_MEM_SYNC_CACHE_FROM_GPU);
+
    *ppData = static_cast<char *>(mem->bo->map) + pMemoryMapInfo->offset;
    return VK_SUCCESS;
 }
@@ -4060,6 +4070,11 @@ tu_UnmapMemory2KHR(VkDevice _device, const VkMemoryUnmapInfoKHR *pMemoryUnmapInf
 
    if (mem == NULL)
       return VK_SUCCESS;
+
+   /* Flush CPU writes back to the GPU before the mapping disappears. */
+   if (device->physical_device->has_cached_non_coherent_memory)
+      tu_bo_sync_cache(device, mem->bo, 0, VK_WHOLE_SIZE,
+                       TU_MEM_SYNC_CACHE_TO_GPU);
 
    return tu_bo_unmap(device, mem->bo, pMemoryUnmapInfo->flags & VK_MEMORY_UNMAP_RESERVE_BIT_EXT);
 }
@@ -4549,7 +4564,9 @@ tu_GetMemoryFdKHR(VkDevice _device,
    if (memory->image) {
       struct fdl_layout *l = &memory->image->layout[0];
       uint64_t modifier;
-      if (l->ubwc) {
+      if (device->physical_device->info->chip == 5) {
+         modifier = DRM_FORMAT_MOD_LINEAR;
+      } else if (l->ubwc) {
          modifier = DRM_FORMAT_MOD_QCOM_COMPRESSED;
       } else if (l->tile_mode == 2) {
          modifier = DRM_FORMAT_MOD_QCOM_TILED2;

@@ -555,6 +555,10 @@ struct tu_cmd_state
    uint32_t max_index_count;
    uint8_t index_size;
 
+   /* a5xx CPU index expansion needs the original buffer objects. */
+   struct tu_buffer *index_buffer;
+   struct tu_buffer *vb_buffer[MAX_VBS];
+
    /* because streamout base has to be 32-byte aligned
     * there is an extra offset to deal with when it is
     * unaligned

@@ -4705,10 +4705,12 @@ tu_CmdBindVertexBuffers2(VkCommandBuffer commandBuffer,
 
    for (uint32_t i = 0; i < bindingCount; i++) {
       if (pBuffers[i] == VK_NULL_HANDLE) {
+         cmd->state.vb_buffer[firstBinding + i] = NULL;
          cmd->state.vb[firstBinding + i].base = 0;
          cmd->state.vb[firstBinding + i].size = 0;
       } else {
          struct tu_buffer *buf = tu_buffer_from_handle(pBuffers[i]);
+         cmd->state.vb_buffer[firstBinding + i] = buf;
          cmd->state.vb[firstBinding + i].base = vk_buffer_address(&buf->vk, pOffsets[i]);
          cmd->state.vb[firstBinding + i].size =
             vk_buffer_range(&buf->vk, pOffsets[i], pSizes ? pSizes[i] : VK_WHOLE_SIZE);
@@ -4765,6 +4767,7 @@ tu_CmdBindIndexBuffer2KHR(VkCommandBuffer commandBuffer,
     */
    vk_cmd_set_index_buffer_type(&cmd->vk, indexType);
 
+   cmd->state.index_buffer = buf;
    if (buf) {
       cmd->state.index_va = vk_buffer_address(&buf->vk, offset);
       cmd->state.max_index_count = size >> index_shift;
@@ -4776,6 +4779,21 @@ tu_CmdBindIndexBuffer2KHR(VkCommandBuffer commandBuffer,
    }
 }
 TU_GENX(tu_CmdBindIndexBuffer2KHR);
+
+/* vkCmdBindIndexBuffer is a core 1.0 entrypoint but the driver only has the
+ * 2KHR variant. Without this wrapper the generated weak symbol is a no-op
+ * and indexed draws read address 0. */
+template <chip CHIP>
+VKAPI_ATTR void VKAPI_CALL
+tu_CmdBindIndexBuffer(VkCommandBuffer commandBuffer,
+                      VkBuffer buffer,
+                      VkDeviceSize offset,
+                      VkIndexType indexType)
+{
+   tu_CmdBindIndexBuffer2KHR<CHIP>(commandBuffer, buffer, offset,
+                                   VK_WHOLE_SIZE, indexType);
+}
+TU_GENX(tu_CmdBindIndexBuffer);
 
 template <chip CHIP>
 static void
@@ -9384,7 +9402,7 @@ tu_CmdDrawIndexed(VkCommandBuffer commandBuffer,
          .first_index = firstIndex,
          .vertex_offset = vertexOffset,
       };
-      tu5_draw(cmd, &info);
+      tu5_draw_indexed(cmd, &info);
       return;
    }
 
@@ -10585,6 +10603,14 @@ tu_barrier(struct tu_cmd_buffer *cmd,
            const VkDependencyInfo *dep_infos,
            bool no_sync)
 {
+   /* The a5xx implementation is sysmem-only and all resources are managed
+    * from the CPU side (copies/clears are plain memcpy/memset plus explicit
+    * cache maintenance). The generic a6xx cache-flush packets emitted for
+    * barriers hang the GPU, and there is no GPU-side state to synchronize.
+    */
+   if (cmd->device->physical_device->info->chip == 5)
+      return;
+
    VkPipelineStageFlags2 srcStage = 0;
    VkPipelineStageFlags2 dstStage = 0;
    BITMASK_ENUM(tu_cmd_access_mask) src_flags = 0;

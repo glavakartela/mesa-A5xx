@@ -996,11 +996,15 @@ tu_CreateImage(VkDevice _device,
          modifier = DRM_FORMAT_MOD_LINEAR;
          for (unsigned i = 0; i < mod_info->drmFormatModifierCount; i++) {
             if (mod_info->pDrmFormatModifiers[i] == DRM_FORMAT_MOD_QCOM_COMPRESSED &&
-                !compression_disabled)
+                !compression_disabled &&
+                device->physical_device->info->chip != 5)
                modifier = DRM_FORMAT_MOD_QCOM_COMPRESSED;
          }
       } else {
          modifier = drm_explicit_info->drmFormatModifier;
+         if (device->physical_device->info->chip == 5 &&
+             modifier == DRM_FORMAT_MOD_QCOM_COMPRESSED)
+            return vk_error(device, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
          assert(modifier == DRM_FORMAT_MOD_LINEAR ||
                 modifier == DRM_FORMAT_MOD_QCOM_COMPRESSED);
          assert(modifier != DRM_FORMAT_MOD_QCOM_COMPRESSED ||

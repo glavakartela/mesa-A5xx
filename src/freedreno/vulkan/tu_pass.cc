@@ -993,6 +993,12 @@ attachment_set_ops(struct tu_device *device,
          att->store_stencil = true;
       break;
    default:
+      /* Plain depth formats (D16_UNORM, D32_SFLOAT, X8_D24...) arrive here
+       * with the generic COLOR clear bit. Convert it to the depth aspect so
+       * the sysmem clear path actually clears them.
+       */
+      if (att->clear_mask && vk_format_has_depth(att->format))
+         att->clear_mask = VK_IMAGE_ASPECT_DEPTH_BIT;
       break;
    }
 }

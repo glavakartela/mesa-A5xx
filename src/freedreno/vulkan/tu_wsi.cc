@@ -49,7 +49,11 @@ tu_wsi_init(struct tu_physical_device *physical_device)
    if (result != VK_SUCCESS)
       return result;
 
-   physical_device->wsi_device.supports_modifiers = true;
+   /* a5xx only supports linear color images; advertising DRM format
+    * modifiers would make the Wayland WSI pick QCOM_COMPRESSED and export a
+    * buffer whose layout does not match the modifier. */
+   physical_device->wsi_device.supports_modifiers =
+      physical_device->info->chip != 5;
    physical_device->wsi_device.can_present_on_device =
       tu_wsi_can_present_on_device;
 

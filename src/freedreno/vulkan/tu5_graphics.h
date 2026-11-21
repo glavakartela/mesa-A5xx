@@ -26,6 +26,7 @@ struct tu5_draw_info {
 };
 
 void tu5_draw(struct tu_cmd_buffer *cmd, const struct tu5_draw_info *info);
+void tu5_draw_indexed(struct tu_cmd_buffer *cmd, const struct tu5_draw_info *info);
 
 /* Apply the render-pass loadOp=CLEAR for color attachments. a5xx sysmem
  * rendering has no GMEM, so this is done with a linear memory fill.
