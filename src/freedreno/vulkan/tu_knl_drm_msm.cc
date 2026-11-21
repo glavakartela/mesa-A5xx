@@ -1399,6 +1399,17 @@ tu_knl_drm_msm_load(struct tu_instance *instance,
    device->gmem_base = val;
 
    device->has_set_iova = !msm_common_get_va_prop(device->local_fd, MSM_PIPE_3D0, &device->va_start, &device->va_size);
+   /* Some older kernels report VA props but with a zero/too-small range. */
+   if (device->has_set_iova && device->va_size < 0x100000) {
+      device->has_set_iova = false;
+      device->va_start = 0;
+      device->va_size = 0;
+   }
+   /* vm_bind without a userspace VA range still needs a VMA heap in Turnip. */
+   if (!device->has_set_iova) {
+      device->has_vm_bind = false;
+      device->has_sparse = false;
+   }
    device->has_iova_align = device->has_set_iova;
    device->has_lazy_bos = device->has_set_iova;
    device->has_raytracing = tu_drm_get_param_or(fd, MSM_PARAM_RAYTRACING, &val, false);

@@ -445,6 +445,15 @@ tu_get_features(struct tu_physical_device *pdevice,
 {
    *features = (struct vk_features) { false };
 
+   if (pdevice->info->chip == 5) {
+      /* a5xx compute MVP: expose only what the isolated compute path can
+       * actually honor.
+       */
+      features->robustBufferAccess = true;
+      features->shaderInt64 = true;
+      return;
+   }
+
    /* Vulkan 1.0 */
    features->robustBufferAccess = true;
    features->fullDrawIndexUint32 = true;
@@ -1745,6 +1754,21 @@ tu_physical_device_init(struct tu_physical_device *device,
    }
 
    switch (fd_dev_gen(&device->dev_id)) {
+   case 5: {
+      /* Isolated a5xx compute path. Keep the A6xx-specific GMEM/CCU setup out
+       * of the picture and provide the handful of properties the Vulkan
+       * runtime needs.
+       */
+      device->dev_info = info;
+      device->info = &device->dev_info;
+      device->dev_info.props.max_sets = 4;
+      device->dev_info.props.instr_cache_size = 32;
+      device->dev_info.props.max_storage_buffer_range_bytes = 1u << 30;
+      device->dev_info.props.max_texel_buffer_range_elements = 1u << 27;
+      device->dev_info.props.vs_max_inputs_count = 16;
+      device->usable_sets = device->reserved_set_idx = 3;
+      break;
+   }
    case 6:
    case 7:
    case 8: {
@@ -2334,6 +2358,23 @@ tu_trace_record_ts(struct u_trace *ut, void *cs, void *timestamps,
    return true;
 }
 
+/* a5xx trace timestamps: the same CP_EVENT_WRITE form as A6XX. */
+static bool
+tu_trace_record_ts_a5xx(struct u_trace *ut, void *cs, void *timestamps,
+                        uint64_t offset_B, uint32_t flags)
+{
+   struct tu_suballoc_bo *bo = static_cast<struct tu_suballoc_bo *>(timestamps);
+   struct tu_cs *ts_cs = static_cast<struct tu_cs *>(cs);
+
+   tu_cs_emit_pkt7(ts_cs, CP_EVENT_WRITE, 4);
+   tu_cs_emit(ts_cs, CP_EVENT_WRITE_0_EVENT(RB_DONE_TS) |
+                        CP_EVENT_WRITE_0_TIMESTAMP);
+   tu_cs_emit_qw(ts_cs, bo->iova + offset_B);
+   tu_cs_emit(ts_cs, 0x00000000);
+
+   return true;
+}
+
 static uint64_t
 tu_trace_read_ts(struct u_trace_context *utctx,
                  void *timestamps, uint64_t offset_B,
@@ -2885,6 +2926,13 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
       &dispatch_table, &tu_device_entrypoints, override_initial_entrypoints);
 
    switch (fd_dev_gen(&physical_device->dev_id)) {
+   case 5:
+      /* Temporary: the generated entrypoints are A6XX templates, but every
+       * a5xx-relevant entrypoint branches to the isolated tu5 path at runtime.
+       */
+      vk_device_dispatch_table_from_entrypoints(
+         &dispatch_table, &tu_device_entrypoints_a6xx, false);
+      break;
    case 6:
       vk_device_dispatch_table_from_entrypoints(
          &dispatch_table, &tu_device_entrypoints_a6xx, false);
@@ -2904,7 +2952,8 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
    /* Devices without HW multiview emulate it by replaying each draw once per
     * view, which is done by wrapping the draw entrypoints.
     */
-   if (!physical_device->info->props.has_hw_multiview) {
+   if (!physical_device->info->props.has_hw_multiview &&
+       physical_device->info->chip != 5) {
       tu_install_sw_multiview_draw_entrypoints(&dispatch_table,
                                                physical_device->info);
    }
@@ -3035,14 +3084,16 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
       goto fail_queues;
 
    {
+      const bool is_a5xx = physical_device->info->chip == 5;
+
       struct ir3_compiler_options ir3_options = {
-         .push_ubo_with_preamble = true,
+         .push_ubo_with_preamble = !is_a5xx,
          .disable_cache = true,
          .bindless_fb_read_descriptor = -1,
          .bindless_fb_read_slot = -1,
          .storage_16bit = physical_device->info->props.storage_16bit,
          .storage_8bit = physical_device->info->props.storage_8bit,
-         .shared_push_consts = !TU_DEBUG(PUSH_CONSTS_PER_STAGE),
+         .shared_push_consts = !is_a5xx && !TU_DEBUG(PUSH_CONSTS_PER_STAGE),
          .uche_trap_base = physical_device->uche_trap_base,
          .lower_draw_id = physical_device->info->chip >= A8XX,
       };
@@ -3279,7 +3330,9 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
                      12,
                      tu_trace_create_buffer,
                      tu_trace_destroy_buffer,
-                     TU_CALLX(device, tu_trace_record_ts),
+                     physical_device->info->chip == 5 ?
+                        tu_trace_record_ts_a5xx :
+                        TU_CALLX(device, tu_trace_record_ts),
                      tu_trace_read_ts,
                      tu_trace_capture_data,
                      tu_trace_get_data,

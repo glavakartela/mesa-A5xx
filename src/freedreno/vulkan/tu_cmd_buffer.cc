@@ -17,6 +17,7 @@
 #include "common/freedreno_gpu_event.h"
 #include "common/freedreno_lrz.h"
 #include "common/freedreno_vrs.h"
+#include "tu5_compute.h"
 #include "tu_autotune.h"
 #include "tu_buffer.h"
 #include "tu_clear_blit.h"
@@ -2406,6 +2407,10 @@ tu_emit_bin_preamble(struct tu_device *dev, struct tu_cs *cs, bool bv)
 VkResult
 tu_init_bin_preamble(struct tu_device *device)
 {
+   /* a5xx compute MVP: there is no binning preamble. */
+   if (device->physical_device->info->chip == 5)
+      return VK_SUCCESS;
+
    struct tu_cs preamble_cs;
    VkResult result = tu_cs_begin_sub_stream(&device->sub_cs, 256, &preamble_cs);
    if (result != VK_SUCCESS)
@@ -4530,6 +4535,9 @@ tu_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    if (cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
       switch (cmd_buffer->queue_family_index) {
       case TU_QUEUE_GENERAL:
+         /* a5xx compute MVP: the A6xx+ hardware init block does not apply. */
+         if (cmd_buffer->device->physical_device->info->chip == 5)
+            break;
          TU_CALLX(cmd_buffer->device, tu_init_hw)(cmd_buffer, &cmd_buffer->cs);
          result = tu_cs_get_status(&cmd_buffer->cs);
          if (result != VK_SUCCESS)
@@ -9844,29 +9852,6 @@ tu_install_sw_multiview_draw_entrypoints(
    FD_CALLX(info, tu_install_sw_multiview_draws)(dispatch_table);
 }
 
-struct tu_dispatch_info
-{
-   /**
-    * Determine the layout of the grid (in block units) to be used.
-    */
-   uint32_t blocks[3];
-
-   /**
-    * A starting offset for the grid. If unaligned is set, the offset
-    * must still be aligned.
-    */
-   uint32_t offsets[3];
-   /**
-    * Whether it's an unaligned compute dispatch.
-    */
-   bool unaligned;
-
-   /**
-    * Indirect compute parameters resource.
-    */
-   VkDeviceAddress indirect;
-};
-
 static inline struct ir3_driver_params_cs
 build_driver_params_cs(const struct ir3_shader_variant *variant,
                        const struct tu_dispatch_info *info)
@@ -10079,6 +10064,11 @@ static void
 tu_dispatch(struct tu_cmd_buffer *cmd,
             const struct tu_dispatch_info *info)
 {
+   if (cmd->device->physical_device->info->chip == 5) {
+      tu5_dispatch(cmd, info);
+      return;
+   }
+
    if (!info->indirect &&
        (info->blocks[0] == 0 || info->blocks[1] == 0 || info->blocks[2] == 0))
       return;

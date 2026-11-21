@@ -19,6 +19,7 @@
 
 #include "ir3/ir3_compiler.h"
 #include "ir3/ir3_nir.h"
+#include "tu5_compute.h"
 #include "tu_descriptor_set.h"
 #include "tu_device.h"
 #include "tu_lrz.h"
@@ -205,10 +206,12 @@ tu_spirv_to_nir(struct tu_device *dev,
    const nir_shader_compiler_options *nir_options =
       ir3_get_compiler_options(dev->compiler);
 
+   spirv_to_nir_options spirv_options = tu_spirv_options;
+
    nir_shader *nir;
    VkResult result =
       vk_pipeline_shader_stage_to_nir(&dev->vk, pipeline_flags, stage_info,
-                                      &tu_spirv_options, nir_options,
+                                      &spirv_options, nir_options,
                                       mem_ctx, &nir);
    if (result != VK_SUCCESS)
       return NULL;
@@ -226,8 +229,19 @@ tu_spirv_to_nir(struct tu_device *dev,
     * UBOs/SSBOs, but spirv_to_nir sets them to the total number of objects
     * which is useless for us, so reset them here.
     */
-   nir->info.num_ubos = 0;
-   nir->info.num_ssbos = 0;
+   if (dev->physical_device->info->chip == 5) {
+      uint32_t max_ssbo = 0;
+      nir_foreach_variable_with_modes (var, nir, nir_var_mem_ssbo)
+         max_ssbo = MAX2(max_ssbo, var->data.binding + 1);
+      uint32_t max_ubo = 0;
+      nir_foreach_variable_with_modes (var, nir, nir_var_mem_ubo)
+         max_ubo = MAX2(max_ubo, var->data.binding + 1);
+      nir->info.num_ubos = MAX2(max_ubo, (uint32_t)TU5_MAX_UBOS);
+      nir->info.num_ssbos = MAX2(max_ssbo, (uint32_t)TU5_MAX_SSBOS);
+   } else {
+      nir->info.num_ubos = 0;
+      nir->info.num_ssbos = 0;
+   }
 
    if (dev->physical_device->compiler_options.compute_round_robin) {
       nir->info.occupancy_bounded_workgroup_fairness = true;
@@ -344,6 +358,17 @@ lower_vulkan_resource_index(struct tu_device *dev, nir_builder *b,
 
    unsigned set = nir_intrinsic_desc_set(instr);
    unsigned binding = nir_intrinsic_binding(instr);
+
+   if (dev->physical_device->info->chip == 5) {
+      /* a5xx bindful descriptors: keep the bindless vec3 shape but encode the
+       * hardware SSBO slot (== Vulkan binding) in the first component.
+       */
+      nir_def_replace(&instr->def,
+                      nir_vec3(b, nir_imm_int(b, binding),
+                               nir_imm_int(b, 0), nir_imm_int(b, 0)));
+      return;
+   }
+
    struct tu_descriptor_set_layout *set_layout = layout->set[set].layout;
    struct tu_descriptor_set_binding_layout *binding_layout =
       &set_layout->binding[binding];
@@ -790,6 +815,8 @@ lower_intrinsic(nir_builder *b, nir_intrinsic_instr *instr,
    case nir_intrinsic_ssbo_atomic:
    case nir_intrinsic_ssbo_atomic_swap:
    case nir_intrinsic_get_ssbo_size:
+      if (dev->physical_device->info->chip == 5)
+         return false;
       return lower_ssbo_ubo_intrinsic(dev, b, instr);
 
    case nir_intrinsic_image_deref_load:
@@ -1506,6 +1533,131 @@ shader_uses_push_consts(nir_shader *shader)
 }
 
 static bool
+tu5_trace_desc_binding(nir_def *def, unsigned *slot)
+{
+   nir_instr *instr = nir_def_instr(def);
+
+   switch (instr->type) {
+   case nir_instr_type_intrinsic: {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      switch (intr->intrinsic) {
+      case nir_intrinsic_load_vulkan_descriptor:
+         return tu5_trace_desc_binding(intr->src[0].ssa, slot);
+      case nir_intrinsic_vulkan_resource_index: {
+         if (!nir_src_is_const(intr->src[0]))
+            return false;
+         *slot = nir_intrinsic_binding(intr) + nir_src_as_uint(intr->src[0]);
+         return true;
+      }
+      case nir_intrinsic_vulkan_resource_reindex: {
+         unsigned base;
+         if (!tu5_trace_desc_binding(intr->src[0].ssa, &base) ||
+             !nir_src_is_const(intr->src[1]))
+            return false;
+         *slot = base + nir_src_as_uint(intr->src[1]);
+         return true;
+      }
+      default:
+         return false;
+      }
+   }
+   case nir_instr_type_alu: {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
+         if (tu5_trace_desc_binding(alu->src[i].src.ssa, slot))
+            return true;
+      }
+      return false;
+   }
+   default:
+      return false;
+   }
+}
+
+static bool
+tu5_lower_bindful_ssbo_instr(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+
+   nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+   unsigned desc_src;
+
+   switch (intrin->intrinsic) {
+   case nir_intrinsic_load_ubo:
+   case nir_intrinsic_load_ssbo:
+   case nir_intrinsic_ssbo_atomic:
+   case nir_intrinsic_ssbo_atomic_swap:
+   case nir_intrinsic_get_ssbo_size:
+      desc_src = 0;
+      break;
+   case nir_intrinsic_store_ssbo:
+      desc_src = 1;
+      break;
+   default:
+      return false;
+   }
+
+   if (intrin->src[desc_src].ssa->num_components == 1)
+      return false;
+
+   unsigned binding;
+   if (!tu5_trace_desc_binding(intrin->src[desc_src].ssa, &binding))
+      return false;
+
+   nir_builder b_at = nir_builder_at(nir_before_instr(instr));
+   nir_src_rewrite(&intrin->src[desc_src], nir_imm_int(&b_at, binding));
+   return true;
+}
+
+static bool
+tu5_lower_ssbo_size_instr(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+   if (intr->intrinsic != nir_intrinsic_get_ssbo_size)
+      return false;
+
+   unsigned binding = 0;
+   if (nir_src_is_const(intr->src[0]))
+      binding = nir_src_as_uint(intr->src[0]);
+   if (binding >= TU5_MAX_SSBOS)
+      return false;
+
+   uint32_t base = *(const uint32_t *)data + binding;
+   nir_builder b_at = nir_builder_at(nir_before_instr(instr));
+   nir_def *size = nir_load_const_ir3(&b_at, 1, 32,
+                                      nir_imm_int(&b_at, 0), .base = base);
+   nir_def_replace(&intr->def, size);
+   return true;
+}
+
+static bool
+tu5_lower_ubo_global(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+   if (intr->intrinsic != nir_intrinsic_load_ubo ||
+       !nir_src_is_const(intr->src[0]))
+      return false;
+
+   unsigned binding = nir_src_as_uint(intr->src[0]);
+   uint32_t base = *(const uint32_t *)data + binding * 2;
+   nir_builder b_at = nir_builder_at(nir_before_instr(instr));
+   nir_def *lo = nir_load_const_ir3(&b_at, 1, 32, nir_imm_int(&b_at, 0), .base = base);
+   nir_def *hi = nir_load_const_ir3(&b_at, 1, 32, nir_imm_int(&b_at, 0), .base = base + 1);
+   nir_def *ptr = nir_pack_64_2x32(&b_at, nir_vec2(&b_at, lo, hi));
+   nir_def *addr = nir_iadd(&b_at, ptr, nir_u2u64(&b_at, intr->src[1].ssa));
+   nir_def *val = nir_load_global(&b_at, intr->num_components,
+                                  intr->def.bit_size, addr);
+   nir_def_replace(&intr->def, val);
+   return true;
+}
+
+static bool
 tu_lower_io(nir_shader *shader, struct tu_device *dev,
             struct tu_shader *tu_shader,
             const struct ir3_shader_key *ir3_key,
@@ -1563,6 +1715,11 @@ tu_lower_io(nir_shader *shader, struct tu_device *dev,
 
       ir3_const_alloc(const_allocs, IR3_CONST_ALLOC_PUSH_CONSTS,
                       push_consts_vec4, offset_align_vec4);
+   }
+
+   if (dev->physical_device->info->chip == 5) {
+      ir3_const_alloc(const_allocs, IR3_CONST_ALLOC_SSBO_SIZES,
+                      DIV_ROUND_UP(TU5_MAX_SSBOS, 4), 1);
    }
 
    bool unknown_dynamic_size = false;
@@ -3224,6 +3381,27 @@ tu_upload_variant(struct tu_cs *cs,
    return memory.iova;
 }
 
+/* Emit the per-variant program state. a5xx compute uses its own register
+ * sequence; everything else stays on the normal A6XX+ emitters.
+ */
+static void
+tu_emit_variant_state(struct tu_device *dev,
+                      struct tu_cs *cs,
+                      mesa_shader_stage stage,
+                      const struct ir3_shader_variant *v,
+                      struct tu_pvtmem_config *pvtmem,
+                      uint32_t view_mask,
+                      uint64_t binary_iova)
+{
+   if (dev->physical_device->info->chip == 5) {
+      assert(stage == MESA_SHADER_COMPUTE);
+      tu5_emit_cs_config(cs, v, pvtmem, binary_iova);
+   } else {
+      TU_CALLX(dev, tu6_emit_variant)(cs, stage, v, pvtmem, view_mask,
+                                      binary_iova);
+   }
+}
+
 static VkResult
 tu_upload_shader(struct tu_device *dev,
                  struct tu_shader *shader)
@@ -3323,26 +3501,23 @@ tu_upload_shader(struct tu_device *dev,
       dev->physical_device->info->props.has_hw_multiview
          ? shader->view_mask : 0;
 
-   TU_CALLX(dev, tu6_emit_variant)(
-      &sub_cs, shader->variant->type, shader->variant, &pvtmem_config,
-      hw_view_mask, iova);
+   tu_emit_variant_state(dev, &sub_cs, shader->variant->type,
+                         shader->variant, &pvtmem_config, hw_view_mask, iova);
    shader->state = tu_cs_end_draw_state(&shader->cs, &sub_cs);
 
    if (safe_const) {
       tu_cs_begin_sub_stream(&shader->cs, xs_size +
                              tu_xs_get_additional_cs_size_dwords(safe_const), &sub_cs);
-      TU_CALLX(dev, tu6_emit_variant)(
-         &sub_cs, v->type, safe_const, &pvtmem_config, hw_view_mask,
-         safe_const_iova);
+      tu_emit_variant_state(dev, &sub_cs, v->type, safe_const,
+                            &pvtmem_config, hw_view_mask, safe_const_iova);
       shader->safe_const_state = tu_cs_end_draw_state(&shader->cs, &sub_cs);
    }
 
    if (binning) {
       tu_cs_begin_sub_stream(&shader->cs, xs_size + vpc_size +
                              tu_xs_get_additional_cs_size_dwords(binning), &sub_cs);
-      TU_CALLX(dev, tu6_emit_variant)(
-         &sub_cs, v->type, binning, &pvtmem_config, hw_view_mask,
-         binning_iova);
+      tu_emit_variant_state(dev, &sub_cs, v->type, binning,
+                            &pvtmem_config, hw_view_mask, binning_iova);
       /* emit an empty VPC */
       TU_CALLX(dev, tu6_emit_vpc)(&sub_cs, binning, NULL, NULL, NULL, NULL);
       shader->binning_state = tu_cs_end_draw_state(&shader->cs, &sub_cs);
@@ -3351,9 +3526,9 @@ tu_upload_shader(struct tu_device *dev,
    if (safe_const_binning) {
       tu_cs_begin_sub_stream(&shader->cs, xs_size + vpc_size +
          tu_xs_get_additional_cs_size_dwords(safe_const_binning), &sub_cs);
-      TU_CALLX(dev, tu6_emit_variant)(
-         &sub_cs, v->type, safe_const_binning, &pvtmem_config, hw_view_mask,
-         safe_const_binning_iova);
+      tu_emit_variant_state(dev, &sub_cs, v->type, safe_const_binning,
+                            &pvtmem_config, hw_view_mask,
+                            safe_const_binning_iova);
       /* emit an empty VPC */
       TU_CALLX(dev, tu6_emit_vpc)(&sub_cs, safe_const_binning, NULL, NULL, NULL, NULL);
       shader->safe_const_binning_state = tu_cs_end_draw_state(&shader->cs, &sub_cs);
@@ -3441,6 +3616,10 @@ tu_shader_cache_process_blob(IO &io, struct tu_shader *shader)
    io.bytes(shader->dynamic_descriptor_sizes, sizeof(shader->dynamic_descriptor_sizes));
    io.u32(shader->view_mask);
    io.u8(shader->active_desc_sets);
+   io.u8(shader->num_ssbos);
+   io.bytes(shader->ssbo_map, sizeof(shader->ssbo_map));
+   io.u8(shader->num_ubos);
+   io.bytes(shader->ubo_map, sizeof(shader->ubo_map));
    io.boolean(shader->per_layer_viewport);
 
    io.variant(shader->variant);
@@ -3716,10 +3895,78 @@ tu_shader_create(struct tu_device *dev,
       }
    }
 
+   if (dev->physical_device->info->chip == 5) {
+      /* Record the bindful SSBO map used by tu5_dispatch(). a5xx isam/ldgb
+       * take an immediate state slot, which we define to be the Vulkan
+       * binding number, so only descriptor set 0 is supported for now.
+       */
+      uint32_t max_binding = 0;
+      bool has_ssbo = false;
+
+      nir_foreach_variable_with_modes (var, nir, nir_var_mem_ssbo) {
+         if (var->data.descriptor_set != 0 ||
+             var->data.binding >= TU5_MAX_SSBOS ||
+             shader->num_ssbos >= TU5_MAX_SSBOS) {
+            vk_free(&dev->vk.alloc, shader);
+            return VK_ERROR_FEATURE_NOT_PRESENT;
+         }
+
+         shader->ssbo_map[shader->num_ssbos].set = var->data.descriptor_set;
+         shader->ssbo_map[shader->num_ssbos].binding = var->data.binding;
+         shader->num_ssbos++;
+         max_binding = MAX2(max_binding, var->data.binding);
+         has_ssbo = true;
+      }
+
+      if (has_ssbo)
+         nir->info.num_ssbos = TU5_MAX_SSBOS;
+   }
+
+   if (dev->physical_device->info->chip == 5) {
+      nir_foreach_variable_with_modes (var, nir, nir_var_mem_ubo) {
+         if (var->data.descriptor_set != 0 ||
+             var->data.binding >= TU5_MAX_UBOS) {
+            vk_free(&dev->vk.alloc, shader);
+            return VK_ERROR_FEATURE_NOT_PRESENT;
+         }
+         while (shader->num_ubos <= var->data.binding) {
+            shader->ubo_map[shader->num_ubos].set = 0;
+            shader->ubo_map[shader->num_ubos].binding = 0;
+            shader->num_ubos++;
+         }
+         shader->ubo_map[var->data.binding].set = var->data.descriptor_set;
+         shader->ubo_map[var->data.binding].binding = var->data.binding;
+      }
+   }
+
+   if (dev->physical_device->info->chip == 5) {
+      /* a5xx isam/ldgb take an immediate SSBO state slot; replace the bindless
+       * descriptor vector with that slot before descriptor lowering runs.
+       */
+      NIR_PASS(_, nir, nir_shader_instructions_pass,
+               tu5_lower_bindful_ssbo_instr, nir_metadata_none, NULL);
+   }
+
    struct ir3_const_allocations const_allocs = {};
    NIR_PASS(_, nir, tu_lower_io, dev, shader, ir3_key, layout,
             key->read_only_input_attachments, key->dynamic_renderpass,
             &const_allocs);
+
+   if (dev->physical_device->info->chip == 5) {
+      uint32_t size_base =
+         const_allocs.consts[IR3_CONST_ALLOC_SSBO_SIZES].offset_vec4 * 4;
+      NIR_PASS(_, nir, nir_shader_instructions_pass,
+               tu5_lower_ssbo_size_instr, nir_metadata_none, &size_base);
+   }
+
+   if (dev->physical_device->info->chip == 5 && shader->num_ubos) {
+      uint32_t ptrs_vec4 = DIV_ROUND_UP(shader->num_ubos * 2, 4);
+      ir3_const_alloc(&const_allocs, IR3_CONST_ALLOC_UBO_PTRS, ptrs_vec4, 1);
+      uint32_t base = const_allocs.consts[IR3_CONST_ALLOC_UBO_PTRS].offset_vec4 * 4;
+      NIR_PASS(_, nir, nir_shader_instructions_pass,
+               tu5_lower_ubo_global, nir_metadata_none, &base);
+      nir->info.num_ubos = 0;
+   }
 
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 
@@ -3729,9 +3976,10 @@ tu_shader_create(struct tu_device *dev,
    ir3_finalize_nir(dev->compiler, &nir_options, nir);
 
    /* This has to happen after finalizing, so that we know the final bitsize
-    * after vectorizing.
+    * after vectorizing. The a5xx bindful path has no memory descriptors.
     */
-   NIR_PASS(_, nir, tu_nir_lower_ssbo_descriptor, dev);
+   if (dev->physical_device->info->chip != 5)
+      NIR_PASS(_, nir, tu_nir_lower_ssbo_descriptor, dev);
 
    if (dev->physical_device->compiler_options.enable_ssbo_emulation) {
       nir_lower_ssbo_options options = {
@@ -4215,6 +4463,10 @@ tu_init_empty_shaders(struct tu_device *dev)
 {
    VkResult result;
 
+   /* a5xx compute MVP: no graphics stages, so no empty TCS/TES/GS/FS. */
+   if (dev->physical_device->info->chip == 5)
+      return VK_SUCCESS;
+
    result = tu_empty_shader_create(dev, &dev->empty_tcs, MESA_SHADER_TESS_CTRL);
    if (result != VK_SUCCESS)
       goto out;
@@ -4254,11 +4506,16 @@ out:
 void
 tu_destroy_empty_shaders(struct tu_device *dev)
 {
-   vk_pipeline_cache_object_unref(&dev->vk, &dev->empty_tcs->base);
-   vk_pipeline_cache_object_unref(&dev->vk, &dev->empty_tes->base);
-   vk_pipeline_cache_object_unref(&dev->vk, &dev->empty_gs->base);
-   vk_pipeline_cache_object_unref(&dev->vk, &dev->empty_fs->base);
-   vk_pipeline_cache_object_unref(&dev->vk, &dev->empty_fs_fdm->base);
+   if (dev->empty_tcs)
+      vk_pipeline_cache_object_unref(&dev->vk, &dev->empty_tcs->base);
+   if (dev->empty_tes)
+      vk_pipeline_cache_object_unref(&dev->vk, &dev->empty_tes->base);
+   if (dev->empty_gs)
+      vk_pipeline_cache_object_unref(&dev->vk, &dev->empty_gs->base);
+   if (dev->empty_fs)
+      vk_pipeline_cache_object_unref(&dev->vk, &dev->empty_fs->base);
+   if (dev->empty_fs_fdm)
+      vk_pipeline_cache_object_unref(&dev->vk, &dev->empty_fs_fdm->base);
 }
 
 void

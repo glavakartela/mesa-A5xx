@@ -234,7 +234,9 @@ enum ir3_const_alloc_type {
    IR3_CONST_ALLOC_PRIMITIVE_MAP = 11,
    /* For SSBO emulation */
    IR3_CONST_ALLOC_BINDLESS_BASE_ADDRS = 12,
-   IR3_CONST_ALLOC_MAX = 13,
+   /* a5xx: per-slot SSBO sizes in bytes for get_ssbo_size() */
+   IR3_CONST_ALLOC_SSBO_SIZES = 13,
+   IR3_CONST_ALLOC_MAX = 14,
 };
 
 struct ir3_const_allocation {

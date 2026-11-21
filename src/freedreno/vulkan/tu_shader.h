@@ -59,6 +59,12 @@ struct tu_const_state
    struct ir3_driver_ubo bindless_base_addrs_ubo;
 };
 
+/* a5xx bindful SSBO mapping. The hardware SSBO slot is the Vulkan binding
+ * number, so only set 0 is supported by the current MVP.
+ */
+#define TU5_MAX_SSBOS 8
+#define TU5_MAX_UBOS 8
+
 struct tu_shader
 {
    struct vk_pipeline_cache_object base;
@@ -78,6 +84,16 @@ struct tu_shader
    struct tu_const_state const_state;
    uint32_t view_mask;
    uint8_t active_desc_sets;
+
+   /* a5xx only: bindful SSBO/UBO slots recorded at shader creation. */
+   uint8_t num_ssbos;
+   struct {
+      uint8_t set, binding;
+   } ssbo_map[TU5_MAX_SSBOS];
+   uint8_t num_ubos;
+   struct {
+      uint8_t set, binding;
+   } ubo_map[TU5_MAX_UBOS];
 
    /* The dynamic buffer descriptor size for descriptor sets that we know
     * about. This is used when linking to piece together the sizes and from

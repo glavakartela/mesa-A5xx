@@ -875,6 +875,28 @@ tu_restore_suspended_pass(struct tu_cmd_buffer *cmd,
 template <chip CHIP>
 void tu_cmd_render(struct tu_cmd_buffer *cmd, const VkOffset2D *fdm_offsets);
 
+struct tu_dispatch_info {
+   /**
+    * Determine the layout of the grid (in block units) to be used.
+    */
+   uint32_t blocks[3];
+
+   /**
+    * A starting offset for the grid. If unaligned is set, the offset
+    * must still be aligned.
+    */
+   uint32_t offsets[3];
+   /**
+    * Whether it's an unaligned compute dispatch.
+    */
+   bool unaligned;
+
+   /**
+    * Indirect compute parameters resource.
+    */
+   VkDeviceAddress indirect;
+};
+
 void tu_dispatch_unaligned(VkCommandBuffer commandBuffer,
                            uint32_t x, uint32_t y, uint32_t z);
 

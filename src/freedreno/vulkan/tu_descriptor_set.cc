@@ -1114,6 +1114,22 @@ write_buffer_descriptor_addr(const struct tu_device *device,
                              const VkDescriptorAddressInfoEXT *buffer_info)
 {
    const struct fd_dev_info *info = device->physical_device->info;
+
+   if (info->chip == 5) {
+      /* a5xx has no texture-style buffer descriptors. Store the raw
+       * address/size pair for tu5_dispatch() to upload as A5XX_SSBO state:
+       *   dword 0/1: 64-bit address
+       *   dword 2:   size in dwords
+       */
+      memset(dst, 0, FDL6_TEX_CONST_DWORDS * sizeof(uint32_t));
+      if (buffer_info && buffer_info->address) {
+         dst[0] = (uint32_t)buffer_info->address;
+         dst[1] = (uint32_t)(buffer_info->address >> 32);
+         dst[2] = DIV_ROUND_UP(buffer_info->range, 4);
+      }
+      return;
+   }
+
    /* This prevents any misconfiguration, but 16-bit descriptor capable of both
     * 16-bit and 32-bit access through isam.v will of course only be functional
     * when 16-bit storage is supported. */
