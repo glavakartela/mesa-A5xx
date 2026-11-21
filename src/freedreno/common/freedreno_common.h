@@ -39,6 +39,7 @@
    ({                                                                        \
       decltype(&thing<A6XX>) genX_thing;                                     \
       switch (info->chip) {                                                  \
+      case 5:                                                                \
       case 6:                                                                \
          genX_thing = &thing<A6XX>;                                          \
          break;                                                              \

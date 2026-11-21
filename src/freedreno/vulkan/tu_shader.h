@@ -75,6 +75,8 @@ struct tu_shader
    struct tu_suballoc_bo bo;
    struct tu_cs cs;
    struct tu_bo *pvtmem_bo;
+   /* a5xx: IOVA of the uploaded variant binary, used by tu5_graphics. */
+   uint64_t binary_iova;
 
    struct tu_draw_state state;
    struct tu_draw_state safe_const_state;

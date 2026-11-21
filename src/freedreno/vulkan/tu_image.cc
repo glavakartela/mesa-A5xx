@@ -566,6 +566,19 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
       force_linear_tile = true;
    }
 
+   /* The a5xx sysmem path only understands linear color images: its MRT
+    * descriptors use TILE5_LINEAR and there is no UBWC support. Depth/stencil
+    * is the exception: the hardware does not support linear D/S (fdl6 also
+    * forces tiling for it), and RB_DEPTH_BUFFER_INFO has no tile-mode field,
+    * so it implicitly expects the tiled layout. Just disable UBWC for it.
+    */
+   if (device->physical_device->info->chip == 5) {
+      ubwc_enabled = false;
+      if (!plane_layouts &&
+          !vk_format_is_depth_or_stencil(image->vk.format))
+         force_linear_tile = true;
+   }
+
    /* Force linear tiling for HIC usage with swapped formats. Because tiled
     * images are stored without the swap, we would have to apply the swap when
     * copying on the CPU, which for some formats is tricky.

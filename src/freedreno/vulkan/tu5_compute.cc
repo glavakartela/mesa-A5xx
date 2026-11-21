@@ -23,9 +23,9 @@
 #include "tu_cmd_buffer.h"
 #include "tu_shader.h"
 
-#include "adreno_pm4.xml.h"
 #include "ir3/ir3_shader.h"
 #include "tu5_regs.h"
+#include "tu5_gfx_regs.h"
 
 /* Compact storage-buffer descriptor written by
  * write_buffer_descriptor_addr() when info->chip == 5:
@@ -408,6 +408,18 @@ tu5_dispatch(struct tu_cmd_buffer *cmd, const struct tu_dispatch_info *info)
       return;
 
    const struct ir3_shader_variant *v = shader->variant;
+
+   /* UCHE is physically indexed and survives process switches; BOs of
+    * different processes can alias in physical memory. Invalidate it before
+    * the dispatch so we never read stale shader/descriptor data.
+    */
+   tu_cs_emit_pkt4(&cmd->cs, REG_A5XX_UCHE_CACHE_INVALIDATE_MIN, 5);
+   tu_cs_emit(&cmd->cs, 0);
+   tu_cs_emit(&cmd->cs, 0);
+   tu_cs_emit(&cmd->cs, 0);
+   tu_cs_emit(&cmd->cs, 0);
+   tu_cs_emit(&cmd->cs, 0x12);
+   tu_cs_emit_pkt7(&cmd->cs, CP_WAIT_FOR_IDLE, 0);
 
    tu5_emit_flush(cmd);
    tu5_emit_driver_params(cmd, v, info);

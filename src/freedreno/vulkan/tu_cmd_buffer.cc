@@ -18,6 +18,7 @@
 #include "common/freedreno_lrz.h"
 #include "common/freedreno_vrs.h"
 #include "tu5_compute.h"
+#include "tu5_graphics.h"
 #include "tu_autotune.h"
 #include "tu_buffer.h"
 #include "tu_clear_blit.h"
@@ -5646,6 +5647,22 @@ tu_CmdBindPipeline(VkCommandBuffer commandBuffer,
    assert(pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS);
 
    struct tu_graphics_pipeline *gfx_pipeline = tu_pipeline_to_graphics(pipeline);
+
+   if (cmd->device->physical_device->info->chip == 5) {
+      /* a5xx graphics state is emitted directly at draw time. Do not execute
+       * the A6xx pipeline draw-state objects.
+       */
+      tu_bind_vs(cmd, pipeline->shaders[MESA_SHADER_VERTEX]);
+      tu_bind_fs(cmd, pipeline->shaders[MESA_SHADER_FRAGMENT]);
+      BITSET_ANDNOT(cmd->vk.dynamic_graphics_state.set,
+                    cmd->vk.dynamic_graphics_state.set,
+                    pipeline->static_state_mask);
+      vk_cmd_set_dynamic_graphics_state(&cmd->vk,
+                                        &gfx_pipeline->dynamic_state);
+      if (gfx_pipeline->vi_valid)
+         cmd->state.vi = gfx_pipeline->vi;
+      return;
+   }
    cmd->state.dirty |= TU_CMD_DIRTY_DESC_SETS | TU_CMD_DIRTY_SHADER_CONSTS |
                        TU_CMD_DIRTY_VS_PARAMS | TU_CMD_DIRTY_PROGRAM;
 
@@ -7247,6 +7264,15 @@ tu_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
             idx = att->remapped_clear_att;
          cmd->state.clear_values[idx] = pRenderPassBegin->pClearValues[i];
       }
+   }
+
+   if (cmd->device->physical_device->info->chip == 5) {
+      /* Minimal sysmem renderpass: attachment pointers and clear values are
+       * enough, the actual a5xx state is emitted by tu5_draw. Clears are
+       * applied here, since there is no GMEM to do the load op later.
+       */
+      tu5_clear_attachments(cmd);
+      return;
    }
 
    tu_choose_gmem_layout(cmd);
@@ -9263,6 +9289,18 @@ tu_CmdDraw(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
    struct tu_cs *cs = &cmd->draw_cs;
 
+   if (cmd->device->physical_device->info->chip == 5) {
+      const struct tu5_draw_info info = {
+         .indexed = false,
+         .vertex_count = vertexCount,
+         .instance_count = instanceCount,
+         .first_vertex = firstVertex,
+         .first_instance = firstInstance,
+      };
+      tu5_draw(cmd, &info);
+      return;
+   }
+
    tu6_emit_vs_params(cmd, NULL, 0, firstVertex, firstInstance);
 
    tu6_draw_common<CHIP>(cmd, cs, false, vertexCount);
@@ -9336,6 +9374,19 @@ tu_CmdDrawIndexed(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
    struct tu_cs *cs = &cmd->draw_cs;
+
+   if (cmd->device->physical_device->info->chip == 5) {
+      const struct tu5_draw_info info = {
+         .indexed = true,
+         .instance_count = instanceCount,
+         .first_instance = firstInstance,
+         .index_count = indexCount,
+         .first_index = firstIndex,
+         .vertex_offset = vertexOffset,
+      };
+      tu5_draw(cmd, &info);
+      return;
+   }
 
    tu6_emit_vs_params(cmd, NULL, 0, vertexOffset, firstInstance);
 
@@ -10411,6 +10462,12 @@ tu_CmdEndRenderPass2(VkCommandBuffer commandBuffer,
 
    if (TU_DEBUG(DYNAMIC)) {
       vk_common_CmdEndRenderPass2(commandBuffer, pSubpassEndInfo);
+      return;
+   }
+
+   if (cmd_buffer->device->physical_device->info->chip == 5) {
+      vk_free(&cmd_buffer->vk.pool->alloc, cmd_buffer->state.attachments);
+      tu_reset_render_pass(cmd_buffer);
       return;
    }
 

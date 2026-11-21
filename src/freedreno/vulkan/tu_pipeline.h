@@ -269,6 +269,10 @@ struct tu_graphics_pipeline {
 
    VkImageAspectFlags feedback_loops;
    bool feedback_loop_may_involve_textures;
+
+   /* a5xx: static vertex input state, copied from the pipeline create info. */
+   struct vk_vertex_input_state vi;
+   bool vi_valid;
 };
 
 struct tu_compute_pipeline {

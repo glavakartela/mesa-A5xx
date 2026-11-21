@@ -2064,7 +2064,8 @@ done:
    /* Create empty shaders which contain the draw states to initialize
     * registers for unused shader stages.
     */
-   if (builder->state &
+   if (builder->device->physical_device->info->chip != 5 &&
+       builder->state &
        VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT) {
       if (!shaders[MESA_SHADER_TESS_CTRL]) {
          shaders[MESA_SHADER_TESS_CTRL] = builder->device->empty_tcs;
@@ -2080,7 +2081,8 @@ done:
       }
    }
 
-   if (builder->state &
+   if (builder->device->physical_device->info->chip != 5 &&
+       builder->state &
        VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT) {
       if (!shaders[MESA_SHADER_FRAGMENT]) {
          shaders[MESA_SHADER_FRAGMENT] =
@@ -4613,6 +4615,27 @@ tu_pipeline_builder_build(struct tu_pipeline_builder *builder,
          vk_object_free(&builder->device->vk, builder->alloc, *pipeline);
          return result;
       }
+   }
+
+   if (builder->device->physical_device->info->chip == 5) {
+      /* a5xx has no A6xx-style program/load states. Only the compiled shader
+       * objects and the Vulkan dynamic state are needed by tu5_draw().
+       */
+      struct tu_graphics_pipeline *gfx_pipeline =
+         tu_pipeline_to_graphics(*pipeline);
+      gfx_pipeline->dynamic_state.ms.sample_locations =
+         &gfx_pipeline->sample_locations;
+      vk_dynamic_graphics_state_fill(&gfx_pipeline->dynamic_state,
+                                     &builder->graphics_state);
+      gfx_pipeline->feedback_loops =
+         vk_pipeline_flags_feedback_loops(builder->graphics_state.pipeline_flags);
+      gfx_pipeline->feedback_loop_may_involve_textures =
+         builder->graphics_state.feedback_loop_not_input_only;
+      if (builder->graphics_state.vi) {
+         gfx_pipeline->vi = *builder->graphics_state.vi;
+         gfx_pipeline->vi_valid = true;
+      }
+      return VK_SUCCESS;
    }
 
    result = tu_pipeline_allocate_cs(builder->device, *pipeline,

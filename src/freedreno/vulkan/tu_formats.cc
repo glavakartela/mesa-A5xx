@@ -430,7 +430,8 @@ tu_GetPhysicalDeviceFormatProperties2(
       }
 
       /* note: ubwc_possible() argument values to be ignored except for format */
-      if (pFormatProperties->formatProperties.optimalTilingFeatures &&
+      if (physical_device->info->chip != 5 &&
+          pFormatProperties->formatProperties.optimalTilingFeatures &&
           tiling_possible(format) &&
           ubwc_possible(NULL, format, VK_IMAGE_TYPE_2D, 0, 0, 0,
                         physical_device->info, VK_SAMPLE_COUNT_1_BIT, 1,
@@ -461,7 +462,8 @@ tu_GetPhysicalDeviceFormatProperties2(
       }
 
       /* note: ubwc_possible() argument values to be ignored except for format */
-      if (props3->optimalTilingFeatures &&
+      if (physical_device->info->chip != 5 &&
+          props3->optimalTilingFeatures &&
           tiling_possible(format) &&
           ubwc_possible(NULL, format, VK_IMAGE_TYPE_2D, 0, 0, 0,
                         physical_device->info, VK_SAMPLE_COUNT_1_BIT, 1,
