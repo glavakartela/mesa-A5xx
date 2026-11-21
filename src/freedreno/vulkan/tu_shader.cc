@@ -3696,6 +3696,17 @@ tu_shader_cache_process_blob(IO &io, struct tu_shader *shader)
    io.bytes(shader->ubo_map, sizeof(shader->ubo_map));
    io.boolean(shader->per_layer_viewport);
 
+   /* a5xx has bindful TPL1 state: the draw-time texture/sampler setup reads
+    * these tables.  They must be part of the pipeline-cache blob, otherwise a
+    * warm-cache shader has num_textures == 0 and the driver skips programming
+    * TEX_CONST entirely, so the GPU samples a null descriptor (black output
+    * plus translation faults at IOVA 0).
+    */
+   io.u8(shader->num_textures);
+   io.bytes(shader->tex_map, sizeof(shader->tex_map));
+   io.u8(shader->num_samplers);
+   io.bytes(shader->samp_map, sizeof(shader->samp_map));
+
    io.variant(shader->variant);
 
    uint8_t has_safe_const;

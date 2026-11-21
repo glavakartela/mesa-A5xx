@@ -119,6 +119,12 @@ tu_device_get_cache_uuid(struct tu_physical_device *device, void *uuid)
    if (!tu_device_get_build_id(&ctx))
       return -1;
 
+   /* Bump this whenever the VkPipelineCache/tu_shader blob format changes, so
+    * stale on-disk entries from an older build are not deserialized.
+    */
+   const uint32_t cache_format_version = 1;
+   _mesa_blake3_update(&ctx, &cache_format_version, sizeof(cache_format_version));
+
    _mesa_blake3_update(&ctx, &chip_id, sizeof(chip_id));
    _mesa_blake3_update(&ctx, &device->uche_trap_base, sizeof(device->uche_trap_base));
    _mesa_blake3_update(&ctx, &device->compiler_options,
