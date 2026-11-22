@@ -457,6 +457,10 @@ tu_get_features(struct tu_physical_device *pdevice,
        */
       features->robustBufferAccess = true;
       features->shaderInt64 = true;
+      /* vkmark requests this feature even when it does not sample
+       * anisotropically; the hardware supports it.
+       */
+      features->samplerAnisotropy = true;
       return;
    }
 
