@@ -5,27 +5,18 @@ English: [README.en.md](README.en.md)
 Mesa-дерево: `~/mesa-a5xx-work`, ветка master.
 
 Коммиты:
-- `09bd044` — изолированный a5xx compute-путь;
-- `16f2474` — доведение до работы на Adreno 509;
-- `a8f7fd5` — несколько SSBO и indirect dispatch;
-- `a5d864c` — UBO через global loads;
-- `80108be` — массивы дескрипторов (bindful SSBO);
-- `d729aaf` — WIP графический путь;
-- `1468d99` — **первый рабочий Vulkan-треугольник (sysmem)**;
-- `66125ee` — UCHE invalidate в compute;
-- `36dfff4` — Y-ориентация viewport, points, polygon mode;
-- `791e889` — loadOp=CLEAR через `CP_MEM_WRITE`, linear-only для chip 5;
-- `85f4c53` — depth/stencil (D16/D24S8/D32/D32S8), depth test;
-- `06e204b` — blending (факторы, op, blend constants);
-- `08e28cf` — несколько MRT;
-- `92caef4` — bindful-текстуры (TPL1), WIP;
-- `91b0318` — текстуры + varying через VB, фикс HLSQ sysval regid;
-- `98ea3ad` — **WIP**: f16-текстуры, HALFREGFOOTPRINT, FOUR_QUADS, фикс compute preload;
-- `7c3da2b` — cache sync на map/unmap (a5xx рекламирует HOST_COHERENT, но CPU-кэш нужно чистить);
-- `ce84bda` — CPU-пути для buffer/image ops, barrier'ы на chip 5 — no-op;
-- `1709362` — a5xx не рекламирует/не экспортирует DRM modifiers (только LINEAR);
-- `fbe11fb` — graphics UBO: указатели в const state (иначе VS/FS читает 0 и GPU висит);
-- `vkCmdBindIndexBuffer` — реализован (core 1.0 entrypoint был weak-заглушкой).
+- `83f34df` — compute bring-up для Adreno 509;
+- `31237b7` — sysmem graphics bring-up;
+- `3490401` — bindful TPL1-текстуры;
+- `064541c` — WSI, CPU-копии и indexed draws;
+- `ca8636a` — тесты, документация, installer и KWin-обходы;
+- `51828ed` — f32 texture samples;
+- `04fdfbf` — bindful tex/sampler tables в pipeline cache;
+- `a6e57fe` — публичный installer и документация (тег `a5xx-vkcube-working`);
+- `43823af` — `samplerAnisotropy` для vkmark.
+
+Последний прогон vkmark: сцены shading/texture/effect2d/desktop/cube
+проходят, 2-минутный стресс без reset/fault, ~49–53 °C.
 
 Проверено на телефоне (Adreno 509):
 

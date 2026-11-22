@@ -88,3 +88,13 @@ English | [Русский](STABILITY.md)
 - Open question: remaining white stripes/"bricks" - verify with `sysmem`
   + no-scanout; if they remain, try `noblit,inorder,gmem` or rebuild a
   newer fd5 GL.
+
+## Run 3: vkmark (2026-11-22)
+
+- `samplerAnisotropy` for chip 5 (`43823af`) lets vkmark create a Vulkan
+  device.
+- The shading, texture, effect2d, desktop and cube scenes pass.
+- Two-minute stress: no reset or fault, ~49–53 °C.
+- The kernel progress-aware fix (`7.2-whyred-drivers`) was verified
+  separately: a long non-preemptable draw no longer triggers a false
+  reset; a real hang stops the ALU and the watchdog fires.

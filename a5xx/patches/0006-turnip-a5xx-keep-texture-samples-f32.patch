@@ -1,0 +1,65 @@
+From 51828edb83b03d8aa3722f8a3ddccfccf85279c6 Mon Sep 17 00:00:00 2001
+From: Kulesha Evgeniy <voovdop@gmail.com>
+Date: Sat, 21 Nov 2026 18:18:27 +0200
+Subject: [PATCH 6/9] turnip/a5xx: keep texture samples f32
+
+The a5xx bring-up forced every float texture result to f16 (sam (f16) + cov.f16f32) because f32 sampling had been seen returning zeros.  On SDM636/a509 the opposite is true: f16 sampling returns zeros, so vkcube rendered a black cube and each frame produced a TPL1 translation fault at IOVA 0.  f32 sam renders correctly, so drop the f16 lowering and document why it must not come back.
+
+Signed-off-by: Kulesha Evgeniy <voovdop@gmail.com>
+---
+ src/freedreno/vulkan/tu_shader.cc | 34 ++++++-------------------------
+ 1 file changed, 6 insertions(+), 28 deletions(-)
+
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index 491592c..410ba5f 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -1075,30 +1075,13 @@ lower_tex_texel_buffer_to_image(
+  * the TPL1 texture/sampler slot and drop the descriptor deref sources. The
+  * driver emits TPL1 state for those slots at draw time.
+  */
+-/* a5xx's texture unit returns half-precision values.  A highp Vulkan
+- * shader would otherwise get a "sam (f32)" instruction, which is unreliable
+- * on this generation (observed as zero samples and GPU hangs).  Force the
+- * texture result to f16 and convert back to f32, matching what fd5 does for
+- * mediump shaders.
++/* NOTE: a5xx texture sampling must stay f32.  An earlier workaround forced
++ * every float texture result to f16 ("sam (f16)" + cov.f16f32) on the theory
++ * that f32 sampling was unreliable, but on SDM636/a509 the f16 sample path
++ * returns zeros every frame (black vkcube) and is accompanied by TPL1
++ * translation faults at IOVA 0.  f32 "sam" renders correctly, so the lowering
++ * was removed.  See opencode/GPU-TEXTURE-F16-2026-11-21.md.
+  */
+-static bool
+-tu5_lower_tex_to_f16(nir_builder *b, nir_instr *instr, void *data)
+-{
+-   if (instr->type != nir_instr_type_tex)
+-      return false;
+-
+-   nir_tex_instr *tex = nir_instr_as_tex(instr);
+-   if (tex->dest_type != nir_type_float32)
+-      return false;
+-
+-   tex->def.bit_size = 16;
+-   tex->dest_type = nir_type_float16;
+-
+-   b->cursor = nir_after_instr(&tex->instr);
+-   nir_def *cvt = nir_f2f32(b, &tex->def);
+-   nir_def_rewrite_uses_after(&tex->def, cvt);
+-   return true;
+-}
+ 
+ static bool
+ tu5_lower_bindful_tex(nir_tex_instr *tex, struct tu_shader *shader, bool ref)
+@@ -4043,11 +4026,6 @@ tu_shader_create(struct tu_device *dev,
+             key->read_only_input_attachments, key->dynamic_renderpass,
+             &const_allocs);
+ 
+-   if (dev->physical_device->info->chip == 5) {
+-      NIR_PASS(_, nir, nir_shader_instructions_pass,
+-               tu5_lower_tex_to_f16, nir_metadata_none, NULL);
+-   }
+-
+    if (dev->physical_device->info->chip == 5) {
+       uint32_t size_base =
+          const_allocs.consts[IR3_CONST_ALLOC_SSBO_SIZES].offset_vec4 * 4;

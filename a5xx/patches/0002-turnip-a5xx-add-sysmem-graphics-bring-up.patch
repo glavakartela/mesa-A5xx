@@ -1,29 +1,26 @@
-From d729aaf975a2104350b19aa400895ec39160ee90 Mon Sep 17 00:00:00 2001
-From: local <local@local>
-Date: Fri, 20 Nov 2026 08:16:20 +0200
-Subject: [PATCH 12/29] turnip/a5xx: WIP graphics path (sysmem MRT, VS/FS, VFD)
+From 31237b7e473d2363e0fd5b3ba3b32cd0bbc6fca3 Mon Sep 17 00:00:00 2001
+From: Kulesha Evgeniy <voovdop@gmail.com>
+Date: Sat, 21 Nov 2026 18:18:26 +0200
+Subject: [PATCH 2/9] turnip/a5xx: add sysmem graphics bring-up
 
-- isolated tu5 graphics emitter with sysmem render target, VS/FS state,
-  vertex fetch, sysmem clear and CCU flush helpers
-- map chip 5 to the generic A6XX template for image/layout helpers
-- a5xx graphics pipeline: skip A6xx program state, keep dynamic state and
-  static vertex input for the tu5 draw path
-- preserve compiled shader binary IOVA for draw-time emission
+Add the sysmem graphics path: VS/FS, VFD, viewport orientation, point and polygon modes, render-pass clears without GMEM, depth/stencil attachments, blending, multiple render targets and the 10-bit swapchain format.
 
-Draw currently renders nothing or hangs; WIP checkpoint.
+Signed-off-by: Kulesha Evgeniy <voovdop@gmail.com>
 ---
  src/freedreno/common/freedreno_common.h |    1 +
  src/freedreno/vulkan/meson.build        |    1 +
- src/freedreno/vulkan/tu5_compute.cc     |    1 -
+ src/freedreno/vulkan/tu5_compute.cc     |   14 +-
  src/freedreno/vulkan/tu5_gfx_regs.h     | 3365 +++++++++++++++++++++++
- src/freedreno/vulkan/tu5_graphics.cc    | 1098 ++++++++
- src/freedreno/vulkan/tu5_graphics.h     |   30 +
- src/freedreno/vulkan/tu_cmd_buffer.cc   |   55 +
+ src/freedreno/vulkan/tu5_graphics.cc    | 1890 +++++++++++++
+ src/freedreno/vulkan/tu5_graphics.h     |   35 +
+ src/freedreno/vulkan/tu_cmd_buffer.cc   |   57 +
+ src/freedreno/vulkan/tu_formats.cc      |    6 +-
+ src/freedreno/vulkan/tu_image.cc        |   13 +
  src/freedreno/vulkan/tu_pipeline.cc     |   27 +-
  src/freedreno/vulkan/tu_pipeline.h      |    4 +
  src/freedreno/vulkan/tu_shader.cc       |    9 +-
  src/freedreno/vulkan/tu_shader.h        |    2 +
- 11 files changed, 4588 insertions(+), 5 deletions(-)
+ 13 files changed, 5417 insertions(+), 7 deletions(-)
  create mode 100644 src/freedreno/vulkan/tu5_gfx_regs.h
  create mode 100644 src/freedreno/vulkan/tu5_graphics.cc
  create mode 100644 src/freedreno/vulkan/tu5_graphics.h
@@ -53,17 +50,39 @@ index f7afb79..d6cf824 100644
  
  libtu_files += custom_target(
 diff --git a/src/freedreno/vulkan/tu5_compute.cc b/src/freedreno/vulkan/tu5_compute.cc
-index b7c9f41..0d3df43 100644
+index b7c9f41..811208a 100644
 --- a/src/freedreno/vulkan/tu5_compute.cc
 +++ b/src/freedreno/vulkan/tu5_compute.cc
-@@ -23,7 +23,6 @@
+@@ -23,9 +23,9 @@
  #include "tu_cmd_buffer.h"
  #include "tu_shader.h"
  
 -#include "adreno_pm4.xml.h"
  #include "ir3/ir3_shader.h"
  #include "tu5_regs.h"
++#include "tu5_gfx_regs.h"
  
+ /* Compact storage-buffer descriptor written by
+  * write_buffer_descriptor_addr() when info->chip == 5:
+@@ -409,6 +409,18 @@ tu5_dispatch(struct tu_cmd_buffer *cmd, const struct tu_dispatch_info *info)
+ 
+    const struct ir3_shader_variant *v = shader->variant;
+ 
++   /* UCHE is physically indexed and survives process switches; BOs of
++    * different processes can alias in physical memory. Invalidate it before
++    * the dispatch so we never read stale shader/descriptor data.
++    */
++   tu_cs_emit_pkt4(&cmd->cs, REG_A5XX_UCHE_CACHE_INVALIDATE_MIN, 5);
++   tu_cs_emit(&cmd->cs, 0);
++   tu_cs_emit(&cmd->cs, 0);
++   tu_cs_emit(&cmd->cs, 0);
++   tu_cs_emit(&cmd->cs, 0);
++   tu_cs_emit(&cmd->cs, 0x12);
++   tu_cs_emit_pkt7(&cmd->cs, CP_WAIT_FOR_IDLE, 0);
++
+    tu5_emit_flush(cmd);
+    tu5_emit_driver_params(cmd, v, info);
+    tu5_emit_push_consts(cmd, v);
 diff --git a/src/freedreno/vulkan/tu5_gfx_regs.h b/src/freedreno/vulkan/tu5_gfx_regs.h
 new file mode 100644
 index 0000000..783e341
@@ -3437,10 +3456,10 @@ index 0000000..783e341
 +#endif
 diff --git a/src/freedreno/vulkan/tu5_graphics.cc b/src/freedreno/vulkan/tu5_graphics.cc
 new file mode 100644
-index 0000000..394fede
+index 0000000..2aa198b
 --- /dev/null
 +++ b/src/freedreno/vulkan/tu5_graphics.cc
-@@ -0,0 +1,1098 @@
+@@ -0,0 +1,1890 @@
 +/*
 + * Copyright © 2026 Mesa contributors
 + * SPDX-License-Identifier: MIT
@@ -3466,7 +3485,10 @@ index 0000000..394fede
 +#include "tu_shader.h"
 +
 +#include "ir3/ir3_shader.h"
++#include "util/half_float.h"
++#include "util/u_math.h"
 +#include "tu5_gfx_regs.h"
++#include "tu5_regs.h"
 +
 +static bool
 +tu5_gfx_no_flush(void)
@@ -3776,8 +3798,10 @@ index 0000000..394fede
 +   tu_cs_emit(cs, 0);
 +
 +   tu_cs_emit_pkt4(cs, REG_A5XX_HLSQ_VS_CNTL, 5);
-+   tu_cs_emit(cs, A5XX_HLSQ_VS_CNTL_INSTRLEN(s[0].instrlen));
-+   tu_cs_emit(cs, A5XX_HLSQ_FS_CNTL_INSTRLEN(s[1].instrlen));
++   tu_cs_emit(cs, A5XX_HLSQ_VS_CNTL_INSTRLEN(s[0].instrlen) |
++                  COND(vs->has_ssbo, A5XX_HLSQ_VS_CNTL_SSBO_ENABLE));
++   tu_cs_emit(cs, A5XX_HLSQ_FS_CNTL_INSTRLEN(s[1].instrlen) |
++                  COND(fs->has_ssbo, A5XX_HLSQ_FS_CNTL_SSBO_ENABLE));
 +   tu_cs_emit(cs, 0);
 +   tu_cs_emit(cs, 0);
 +   tu_cs_emit(cs, 0);
@@ -3846,9 +3870,11 @@ index 0000000..394fede
 +   tu5_emit_reg(cs, REG_A5XX_SP_PRIMITIVE_CNTL,
 +                A5XX_SP_PRIMITIVE_CNTL_VSOUT(linkage->cnt));
 +
++   bool force_varying = getenv("TU5_GFX_FORCE_VARYING") != NULL;
 +   tu5_emit_reg(cs, REG_A5XX_VPC_CNTL_0,
 +                A5XX_VPC_CNTL_0_STRIDE_IN_VPC(linkage->max_loc) |
-+                COND(fs->total_in > 0, A5XX_VPC_CNTL_0_VARYING) |
++                COND(force_varying || fs->total_in > 0,
++                     A5XX_VPC_CNTL_0_VARYING) |
 +                0x10000);
 +
 +   tu5_emit_shader_obj(cs, REG_A5XX_SP_FS_OBJ_START, s[1].iova);
@@ -3884,7 +3910,8 @@ index 0000000..394fede
 +              A5XX_HLSQ_CONTROL_4_REG_IJ_LINEAR_SAMPLE(ij_regid[IJ_LINEAR_SAMPLE])));
 +
 +   tu5_emit_reg(cs, REG_A5XX_SP_FS_CTRL_REG0,
-+      COND(fs->total_in > 0, A5XX_SP_FS_CTRL_REG0_VARYING) |
++      COND(getenv("TU5_GFX_FORCE_VARYING") || fs->total_in > 0,
++           A5XX_SP_FS_CTRL_REG0_VARYING) |
 +      0x40002 |
 +      COND(s[1].instrlen != 0, A5XX_SP_FS_CTRL_REG0_BUFFER) |
 +      A5XX_SP_FS_CTRL_REG0_THREADSIZE(fssz) |
@@ -3893,6 +3920,25 @@ index 0000000..394fede
 +      A5XX_SP_FS_CTRL_REG0_BRANCHSTACK(ir3_shader_branchstack_hw(fs)) |
 +      COND(fs->need_pixlod, A5XX_SP_FS_CTRL_REG0_PIXLODENABLE));
 +
++   if (tu5_gfx_debug()) {
++      fprintf(stderr, "  iova vs=%" PRIx64 " fs=%" PRIx64 "\n",
++              vs_shader->binary_iova, fs_shader->binary_iova);
++      fprintf(stderr, "  vscntl=0x%x fsctrl=0x%x hlsq0=0x%x\n",
++         A5XX_SP_VS_CTRL_REG0_HALFREGFOOTPRINT(s[0].info->max_half_reg + 1) |
++         A5XX_SP_VS_CTRL_REG0_FULLREGFOOTPRINT(s[0].info->max_reg + 1) |
++         COND(s[0].instrlen != 0, A5XX_SP_VS_CTRL_REG0_BUFFER) | 0x2 |
++         A5XX_SP_VS_CTRL_REG0_BRANCHSTACK(ir3_shader_branchstack_hw(vs)) |
++         COND(vs->need_pixlod, A5XX_SP_VS_CTRL_REG0_PIXLODENABLE),
++         COND(fs->total_in > 0, A5XX_SP_FS_CTRL_REG0_VARYING) | 0x40002 |
++         COND(s[1].instrlen != 0, A5XX_SP_FS_CTRL_REG0_BUFFER) |
++         A5XX_SP_FS_CTRL_REG0_THREADSIZE(fssz) |
++         A5XX_SP_FS_CTRL_REG0_HALFREGFOOTPRINT(s[1].info->max_half_reg + 1) |
++         A5XX_SP_FS_CTRL_REG0_FULLREGFOOTPRINT(s[1].info->max_reg + 1) |
++         A5XX_SP_FS_CTRL_REG0_BRANCHSTACK(ir3_shader_branchstack_hw(fs)) |
++         COND(fs->need_pixlod, A5XX_SP_FS_CTRL_REG0_PIXLODENABLE),
++         A5XX_HLSQ_CONTROL_0_REG_FSTHREADSIZE(fssz) |
++            A5XX_HLSQ_CONTROL_0_REG_CSTHREADSIZE(TWO_QUADS) | 0x880);
++   }
 +   tu5_emit_reg(cs, REG_A5XX_HLSQ_UPDATE_CNTL, 0x020fffff);
 +   tu5_emit_reg(cs, REG_A5XX_VPC_GS_SIV_CNTL, 0x0000ffff);
 +   tu5_emit_reg(cs, REG_A5XX_SP_SP_CNTL, 0x00000010);
@@ -3949,6 +3995,9 @@ index 0000000..394fede
 +   for (unsigned i = 0; i < 8; i++)
 +      tu_cs_emit(cs, 0);
 +
++   if (tu5_gfx_debug())
++      fprintf(stderr, "  clip_mask=0x%x cull_mask=0x%x\n",
++              vs->clip_mask, vs->cull_mask);
 +   tu5_emit_reg(cs, REG_A5XX_GRAS_VS_CL_CNTL,
 +                A5XX_GRAS_VS_CL_CNTL_CLIP_MASK(vs->clip_mask) |
 +                A5XX_GRAS_VS_CL_CNTL_CULL_MASK(vs->cull_mask));
@@ -3989,6 +4038,27 @@ index 0000000..394fede
 +   struct tu_cs *cs = &cmd->cs;
 +   tu_cs_emit_pkt7(cs, CP_EVENT_WRITE, 4);
 +   tu_cs_emit(cs, CP_EVENT_WRITE_0_EVENT(PC_CCU_FLUSH_COLOR_TS));
++   tu_cs_emit_qw(cs, global_iova(cmd, seqno_dummy));
++   tu_cs_emit(cs, 0);
++}
++
++static bool
++tu5_has_depth_attachment(struct tu_cmd_buffer *cmd)
++{
++   const struct tu_subpass *subpass = cmd->state.subpass;
++
++   return subpass && cmd->state.attachments &&
++          subpass->depth_stencil_attachment.attachment != VK_ATTACHMENT_UNUSED &&
++          cmd->state.attachments[
++             subpass->depth_stencil_attachment.attachment] != NULL;
++}
++
++static void
++tu5_ccu_flush_depth(struct tu_cmd_buffer *cmd)
++{
++   struct tu_cs *cs = &cmd->cs;
++   tu_cs_emit_pkt7(cs, CP_EVENT_WRITE, 4);
++   tu_cs_emit(cs, CP_EVENT_WRITE_0_EVENT(PC_CCU_FLUSH_DEPTH_TS));
 +   tu_cs_emit_qw(cs, global_iova(cmd, seqno_dummy));
 +   tu_cs_emit(cs, 0);
 +}
@@ -4167,22 +4237,390 @@ index 0000000..394fede
 +}
 +
 +static void
-+tu5_emit_mrt(struct tu_cmd_buffer *cmd,
-+             const struct tu_image_view *iview,
-+             uint32_t width, uint32_t height)
++tu5_emit_gfx_ssbo_state(struct tu_cmd_buffer *cmd,
++                        const struct tu_shader *shader,
++                        enum a4xx_state_block shader_sb)
++{
++   if (!shader->num_ssbos)
++      return;
++
++   struct tu_descriptor_state *ds =
++      tu_get_descriptors_state(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
++   uint64_t addrs[TU5_MAX_SSBOS] = {};
++   uint32_t sizes[TU5_MAX_SSBOS] = {};
++   unsigned max_binding = 0;
++
++   for (unsigned i = 0; i < shader->num_ssbos; i++) {
++      unsigned set = shader->ssbo_map[i].set;
++      unsigned binding = shader->ssbo_map[i].binding;
++      max_binding = MAX2(max_binding, binding);
++
++      const struct tu_descriptor_set *dset =
++         set < MAX_SETS ? ds->sets[set] : NULL;
++      if (!dset || binding >= dset->layout->binding_count || !dset->mapped_ptr)
++         continue;
++
++      const struct tu_descriptor_set_binding_layout *bl =
++         &dset->layout->binding[binding];
++      if (bl->type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
++         continue;
++
++      unsigned array_size = MAX2(bl->array_size, 1);
++      for (unsigned e = 0; e < array_size && binding + e < TU5_MAX_SSBOS; e++) {
++         const uint32_t *desc = dset->mapped_ptr + bl->offset / 4 +
++                                e * bl->size / 4;
++         addrs[binding + e] = desc[0] | ((uint64_t)desc[1] << 32);
++         sizes[binding + e] = desc[2];
++         max_binding = MAX2(max_binding, binding + e);
++      }
++   }
++
++   unsigned count = max_binding + 1;
++
++   tu_cs_emit_pkt7(&cmd->cs, CP_LOAD_STATE4, 3 + 2 * count);
++   tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_0_DST_OFF(0) |
++                            CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
++                            CP_LOAD_STATE4_0_STATE_BLOCK(SB4_SSBO) |
++                            CP_LOAD_STATE4_0_NUM_UNIT(count));
++   tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
++                            CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
++   tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
++   for (unsigned i = 0; i < count; i++) {
++      tu_cs_emit(&cmd->cs, TU5_SSBO_1_0_WIDTH(sizes[i] & 0xffff));
++      tu_cs_emit(&cmd->cs, TU5_SSBO_1_1_HEIGHT(sizes[i] >> 16));
++   }
++
++   tu_cs_emit_pkt7(&cmd->cs, CP_LOAD_STATE4, 3 + 2 * count);
++   tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_0_DST_OFF(0) |
++                            CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
++                            CP_LOAD_STATE4_0_STATE_BLOCK(SB4_SSBO) |
++                            CP_LOAD_STATE4_0_NUM_UNIT(count));
++   tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_UBO) |
++                            CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
++   tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
++   for (unsigned i = 0; i < count; i++)
++      tu_cs_emit_qw(&cmd->cs, addrs[i]);
++
++   const struct ir3_shader_variant *v = shader->variant;
++   if (ir3_const_can_upload(&v->const_state->allocs,
++                            IR3_CONST_ALLOC_SSBO_SIZES, v->constlen)) {
++      uint32_t off =
++         v->const_state->allocs.consts[IR3_CONST_ALLOC_SSBO_SIZES].offset_vec4;
++      unsigned units = DIV_ROUND_UP(TU5_MAX_SSBOS, 4);
++
++      tu_cs_emit_pkt7(&cmd->cs, CP_LOAD_STATE4, 3 + units * 4);
++      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_0_DST_OFF(off) |
++                               CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
++                               CP_LOAD_STATE4_0_STATE_BLOCK(shader_sb) |
++                               CP_LOAD_STATE4_0_NUM_UNIT(units));
++      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
++                               CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
++      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
++      for (unsigned i = 0; i < units * 4; i++)
++         tu_cs_emit(&cmd->cs, i < TU5_MAX_SSBOS ? sizes[i] * 4 : 0);
++   }
++}
++
++static void
++tu5_emit_global_state(struct tu_cmd_buffer *cmd)
 +{
 +   struct tu_cs *cs = &cmd->cs;
-+   VkFormat vk_format = iview->vk.format;
-+   bool srgb, sint, uint_format;
-+   uint32_t format =
-+      tu5_format(vk_format, &srgb, &sint, &uint_format);
-+   enum a3xx_color_swap swap = tu5_format_swap(vk_format);
-+   uint32_t pitch = iview->view.pitch;
-+   uint32_t layer_size = iview->view.layer_size;
-+   uint64_t base = iview->view.base_addr;
++
++   /* Sysmem rendering needs the CP render mode set to BYPASS; RB_CNTL_BYPASS
++    * alone is not enough for shader (MRT) writes.
++    */
++   tu_cs_emit_pkt7(cs, CP_SET_RENDER_MODE, 5);
++   tu_cs_emit(cs, CP_SET_RENDER_MODE_0_MODE(BYPASS));
++   tu_cs_emit(cs, 0);
++   tu_cs_emit(cs, 0);
++   tu_cs_emit(cs, 0);
++   tu_cs_emit(cs, 0);
++
++   /* UCHE is physically indexed and survives process switches, while BOs of
++    * different processes can alias in physical memory. Without this, a new
++    * process can read stale vertex/index/shader data from a previous one.
++    */
++   tu_cs_emit_pkt4(cs, REG_A5XX_UCHE_CACHE_INVALIDATE_MIN, 5);
++   tu_cs_emit(cs, 0);
++   tu_cs_emit(cs, 0);
++   tu_cs_emit(cs, 0);
++   tu_cs_emit(cs, 0);
++   tu_cs_emit(cs, 0x12);
++   tu_cs_emit_pkt7(cs, CP_WAIT_FOR_IDLE, 0);
++
++   /* The kernel already programs RB/TPL1 bank bits and the DBG_ECO
++    * workarounds in a5xx_hw_init(). Only the mode registers that are not
++    * part of the kernel init are needed here.
++    */
++   tu5_emit_reg(cs, REG_A5XX_PC_MODE_CNTL, 0x1f);
++   tu5_emit_reg(cs, REG_A5XX_SP_MODE_CNTL, 0x1c);
++   tu5_emit_reg(cs, REG_A5XX_HLSQ_MODE_CNTL, 1);
++   tu5_emit_reg(cs, REG_A5XX_VFD_MODE_CNTL, 0);
++   tu5_emit_reg(cs, REG_A5XX_VPC_MODE_CNTL, 0);
++   tu5_emit_reg(cs, REG_A5XX_SP_VS_CONFIG_MAX_CONST, 0);
++   tu5_emit_reg(cs, REG_A5XX_SP_FS_CONFIG_MAX_CONST, 0);
++   tu5_emit_reg(cs, REG_A5XX_GRAS_SC_SCREEN_SCISSOR_CNTL, 0);
++   tu5_emit_reg(cs, REG_A5XX_GRAS_SC_BIN_CNTL, 0);
++   tu5_emit_reg(cs, REG_A5XX_GRAS_SU_CONSERVATIVE_RAS_CNTL, 0);
++   tu5_emit_reg(cs, REG_A5XX_VPC_FS_PRIMITIVEID_CNTL, 0xff);
++}
++
++/* A5xx sysmem rendering has no GMEM, so RB_CLEAR_CNTL cannot be used to
++ * clear attachments (doing so hangs the GPU). The images created by this
++ * driver are linear, so a render-pass clear can be done with a plain
++ * CP_MEM_WRITE fill of the attachment memory.
++ */
++static bool
++tu5_clear_color_dword(VkFormat format, const VkClearColorValue *color,
++                      uint32_t *out)
++{
++   float rgba[4] = {
++      color->float32[0], color->float32[1],
++      color->float32[2], color->float32[3],
++   };
++   bool srgb = false, bgra = false;
++
++   switch (format) {
++   case VK_FORMAT_R8G8B8A8_UNORM:
++      break;
++   case VK_FORMAT_R8G8B8A8_SRGB:
++      srgb = true;
++      break;
++   case VK_FORMAT_B8G8R8A8_UNORM:
++      bgra = true;
++      break;
++   case VK_FORMAT_B8G8R8A8_SRGB:
++      bgra = true;
++      srgb = true;
++      break;
++   default:
++      return false;
++   }
++
++   uint32_t c[4];
++   for (unsigned i = 0; i < 4; i++) {
++      float v = CLAMP(rgba[i], 0.0f, 1.0f);
++      if (srgb)
++         v = (v <= 0.0031308f) ? v * 12.92f
++                               : 1.055f * powf(v, 1.0f / 2.4f) - 0.055f;
++      c[i] = (uint32_t)(v * 255.0f + 0.5f);
++   }
++
++   if (bgra)
++      *out = c[2] | (c[1] << 8) | (c[0] << 16) | (c[3] << 24);
++   else
++      *out = c[0] | (c[1] << 8) | (c[2] << 16) | (c[3] << 24);
++   return true;
++}
++
++static void
++tu5_fill_linear(struct tu_cs *cs, uint64_t addr, uint64_t size, uint32_t value)
++{
++   /* CP_MEM_WRITE's packet length field is 14 bits including the address. */
++   const uint64_t chunk_size = 16380 * 4;
++
++   for (uint64_t offset = 0; offset < size; offset += chunk_size) {
++      uint64_t chunk = MIN2(size - offset, chunk_size);
++      unsigned dwords = (chunk + 3) / 4;
++
++      tu_cs_emit_pkt7(cs, CP_MEM_WRITE, 2 + dwords);
++      tu_cs_emit_qw(cs, addr + offset);
++      for (unsigned i = 0; i < dwords; i++)
++         tu_cs_emit(cs, value);
++   }
++
++   tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
++}
++
++static bool
++tu5_clear_depth_dword(VkFormat format, float depth, uint32_t stencil,
++                      bool clear_stencil, uint32_t *out)
++{
++   switch (format) {
++   case VK_FORMAT_D16_UNORM: {
++      /* Use double: at 2^24 a float cannot represent the .5 added for
++       * rounding, and the result would overflow into the neighbouring bits.
++       */
++      uint32_t v = (uint32_t)((double)CLAMP(depth, 0.0f, 1.0f) * 65535.0 + 0.5);
++      v = MIN2(v, 0xffffu);
++      *out = v | (v << 16);
++      return true;
++   }
++   case VK_FORMAT_X8_D24_UNORM_PACK32:
++   case VK_FORMAT_D24_UNORM_S8_UINT: {
++      uint32_t v =
++         (uint32_t)((double)CLAMP(depth, 0.0f, 1.0f) * 16777215.0 + 0.5);
++      v = MIN2(v, 0xffffffu);
++      if (clear_stencil)
++         v |= (stencil & 0xff) << 24;
++      *out = v;
++      return true;
++   }
++   case VK_FORMAT_D32_SFLOAT:
++   case VK_FORMAT_D32_SFLOAT_S8_UINT: {
++      union {
++         float f;
++         uint32_t u;
++      } v = { depth };
++      *out = v.u;
++      return true;
++   }
++   default:
++      return false;
++   }
++}
++
++static void
++tu5_clear_ds_attachment(struct tu_cmd_buffer *cmd, unsigned idx,
++                        const struct tu_render_pass_attachment *att,
++                        const struct tu_image_view *iview)
++{
++   VkFormat format = att->format;
++   bool clear_depth = att->clear_mask & VK_IMAGE_ASPECT_DEPTH_BIT;
++   bool clear_stencil = att->clear_mask & VK_IMAGE_ASPECT_STENCIL_BIT;
++   /* For S8 the common code stores the stencil clear in the COLOR bit. */
++   if (format == VK_FORMAT_S8_UINT)
++      clear_stencil = att->clear_mask & VK_IMAGE_ASPECT_COLOR_BIT;
++   bool d24s8 = format == VK_FORMAT_D24_UNORM_S8_UINT;
++   float depth = cmd->state.clear_values[idx].depthStencil.depth;
++   uint32_t stencil = cmd->state.clear_values[idx].depthStencil.stencil;
++   uint64_t height = iview->image->vk.extent.height;
++   const struct fdl6_view *dview =
++      iview->view_depth ? iview->view_depth : &iview->view;
++
++   if (d24s8) {
++      /* Depth and stencil share a dword. A raw fill can only clear both at
++       * once; preserving one of them would need a read-modify-write. If the
++       * other aspect is not loaded (DONT_CARE) overwriting it is fine.
++       */
++      if (clear_depth && clear_stencil) {
++         uint32_t value;
++         if (tu5_clear_depth_dword(format, depth, stencil, true, &value)) {
++            if (tu5_gfx_debug())
++               fprintf(stderr, "  clear: D24S8 addr=%" PRIx64 " pitch=%u"
++                       " h=%" PRIu64 " val=%08x\n", dview->base_addr,
++                       dview->pitch, height, value);
++            tu5_fill_linear(&cmd->cs, dview->base_addr,
++                            (uint64_t)dview->pitch * height, value);
++         }
++      } else if (clear_depth || clear_stencil) {
++         if (!att->load) {
++            uint32_t value;
++            if (tu5_clear_depth_dword(format, depth, stencil,
++                                      clear_stencil, &value))
++               tu5_fill_linear(&cmd->cs, dview->base_addr,
++                               (uint64_t)dview->pitch * height, value);
++         } else if (tu5_gfx_debug()) {
++            fprintf(stderr, "  clear: D24S8 %s-only clear would clobber the "
++                            "other aspect, skipped\n",
++                    clear_depth ? "depth" : "stencil");
++         }
++      }
++      return;
++   }
++
++   if (clear_depth) {
++      uint32_t value;
++      if (tu5_clear_depth_dword(format, depth, 0, false, &value))
++         tu5_fill_linear(&cmd->cs, dview->base_addr,
++                         (uint64_t)dview->pitch * height, value);
++      else if (tu5_gfx_debug())
++         fprintf(stderr, "  clear: unsupported depth format %d, skipped\n",
++                 format);
++   }
++
++   if (clear_stencil) {
++      const struct fdl6_view *sview =
++         iview->view_stencil ? iview->view_stencil : &iview->view;
++      if (format != VK_FORMAT_D32_SFLOAT_S8_UINT &&
++          format != VK_FORMAT_S8_UINT) {
++         if (tu5_gfx_debug())
++            fprintf(stderr, "  clear: unsupported stencil format %d, skipped\n",
++                    format);
++      } else {
++         uint32_t value = (stencil & 0xff) * 0x01010101u;
++         tu5_fill_linear(&cmd->cs, sview->base_addr,
++                         (uint64_t)sview->pitch * height, value);
++      }
++   }
++}
++
++void
++tu5_clear_attachments(struct tu_cmd_buffer *cmd)
++{
++   const struct tu_render_pass *pass = cmd->state.pass;
++
++   if (!pass || !cmd->state.subpass)
++      return;
++
++   uint32_t ds_idx =
++      cmd->state.subpass->depth_stencil_attachment.attachment;
++
++   for (unsigned i = 0; i < MIN2(pass->user_attachment_count,
++                                 pass->attachment_count); i++) {
++      const struct tu_render_pass_attachment *att = &pass->attachments[i];
++      const struct tu_image_view *iview = cmd->state.attachments[i];
++
++      if (!iview)
++         continue;
++
++      if (i == ds_idx) {
++         tu5_clear_ds_attachment(cmd, i, att, iview);
++         continue;
++      }
++
++      if (!(att->clear_mask & VK_IMAGE_ASPECT_COLOR_BIT))
++         continue;
++
++      uint32_t value;
++      if (!tu5_clear_color_dword(att->format, &cmd->state.clear_values[i].color,
++                                 &value)) {
++         if (tu5_gfx_debug())
++            fprintf(stderr, "  clear: unsupported format %d, skipped\n",
++                    att->format);
++         continue;
++      }
++
++      uint32_t width = iview->image->vk.extent.width;
++      uint32_t height = iview->image->vk.extent.height;
++      (void)width;
++
++      tu5_fill_linear(&cmd->cs, iview->view.base_addr,
++                      (uint64_t)iview->view.pitch * height, value);
++
++      if (tu5_gfx_debug())
++         fprintf(stderr, "  clear: att=%u addr=0x%llx pitch=%u h=%u val=0x%08x\n",
++                 i, (unsigned long long)iview->view.base_addr,
++                 iview->view.pitch, height, value);
++   }
++}
++
++static void
++tu5_emit_mrt(struct tu_cmd_buffer *cmd,
++             const struct tu_image_view *iviews[8], unsigned nr)
++{
++   struct tu_cs *cs = &cmd->cs;
++   uint32_t components = 0;
 +
 +   for (unsigned i = 0; i < 8; i++) {
-+      bool used = i == 0;
++      const struct tu_image_view *iview = i < nr ? iviews[i] : NULL;
++      bool used = iview != NULL;
++      bool srgb = false, sint = false, uint_format = false;
++      uint32_t format = 0;
++      enum a3xx_color_swap swap = WZYX;
++      uint32_t pitch = 0, layer_size = 0;
++      uint64_t base = 0;
++
++      if (used) {
++         VkFormat vk_format = iview->vk.format;
++         format = tu5_format(vk_format, &srgb, &sint, &uint_format);
++         swap = tu5_format_swap(vk_format);
++         pitch = iview->view.pitch;
++         layer_size = iview->view.layer_size;
++         base = iview->view.base_addr;
++         components |= 0xf << (4 * i);
++      }
++
 +      tu_cs_emit_pkt4(cs, REG_A5XX_RB_MRT_BUF_INFO(i), 5);
 +      tu_cs_emit(cs,
 +         A5XX_RB_MRT_BUF_INFO_COLOR_FORMAT(used ? format : 0) |
@@ -4191,12 +4629,7 @@ index 0000000..394fede
 +         COND(used && srgb, A5XX_RB_MRT_BUF_INFO_COLOR_SRGB));
 +      tu_cs_emit(cs, A5XX_RB_MRT_PITCH(used ? pitch : 0));
 +      tu_cs_emit(cs, A5XX_RB_MRT_ARRAY_PITCH(used ? layer_size : 0));
-+      if (used) {
-+         tu_cs_emit_qw(cs, base);
-+      } else {
-+         tu_cs_emit(cs, 0);
-+         tu_cs_emit(cs, 0);
-+      }
++      tu_cs_emit_qw(cs, base);
 +
 +      tu5_emit_reg(cs, REG_A5XX_SP_FS_MRT_REG(i),
 +         A5XX_SP_FS_MRT_REG_COLOR_FORMAT(used ? format : 0) |
@@ -4211,8 +4644,7 @@ index 0000000..394fede
 +      tu_cs_emit(cs, A5XX_RB_MRT_FLAG_BUFFER_ARRAY_PITCH(0));
 +   }
 +
-+   (void)width;
-+   (void)height;
++   tu5_emit_reg(cs, REG_A5XX_RB_RENDER_COMPONENTS, components);
 +}
 +
 +static void
@@ -4237,12 +4669,25 @@ index 0000000..394fede
 +   if (dyn->vp.scissor_count > 0)
 +      scissor = dyn->vp.scissors[0];
 +
++   if (tu5_gfx_debug()) {
++      fprintf(stderr, "  viewport: count=%u vp={%f,%f,%f,%f,%f,%f}\n",
++              dyn->vp.viewport_count, vp.x, vp.y, vp.width, vp.height,
++              vp.minDepth, vp.maxDepth);
++      fprintf(stderr, "  scissor: count=%u rect={%d,%d,%u,%u}\n",
++              dyn->vp.scissor_count, scissor.offset.x, scissor.offset.y,
++              scissor.extent.width, scissor.extent.height);
++   }
++
 +   tu_cs_emit_pkt7(cs, CP_WAIT_FOR_IDLE, 0);
 +
 +   tu_cs_emit_pkt4(cs, REG_A5XX_GRAS_CL_VPORT_XOFFSET_0, 6);
 +   tu_cs_emit(cs, A5XX_GRAS_CL_VPORT_XOFFSET_0(vp.x + vp.width * 0.5f));
 +   tu_cs_emit(cs, A5XX_GRAS_CL_VPORT_XSCALE_0(vp.width * 0.5f));
 +   tu_cs_emit(cs, A5XX_GRAS_CL_VPORT_YOFFSET_0(vp.y + vp.height * 0.5f));
++   /* Vulkan NDC has +y pointing down, so the window-space y is
++    * y_offset + y_ndc * height/2 (a positive scale). The GL convention
++    * (used by fd5) applies the opposite sign.
++    */
 +   tu_cs_emit(cs, A5XX_GRAS_CL_VPORT_YSCALE_0(vp.height * 0.5f));
 +   tu_cs_emit(cs, A5XX_GRAS_CL_VPORT_ZOFFSET_0(
 +      (vp.minDepth + vp.maxDepth) * 0.5f));
@@ -4285,6 +4730,242 @@ index 0000000..394fede
 +                A5XX_RB_WINDOW_OFFSET_X(0) | A5XX_RB_WINDOW_OFFSET_Y(0));
 +}
 +
++static uint32_t
++tu5_depth_format(VkFormat format)
++{
++   switch (format) {
++   case VK_FORMAT_D16_UNORM:
++      return A5EN_DEPTH5_16;
++   case VK_FORMAT_X8_D24_UNORM_PACK32:
++   case VK_FORMAT_D24_UNORM_S8_UINT:
++      return A5EN_DEPTH5_24_8;
++   case VK_FORMAT_D32_SFLOAT:
++   case VK_FORMAT_D32_SFLOAT_S8_UINT:
++      return A5EN_DEPTH5_32;
++   default:
++      return A5EN_DEPTH5_NONE;
++   }
++}
++
++static bool
++tu5_format_has_stencil(VkFormat format)
++{
++   return format == VK_FORMAT_D24_UNORM_S8_UINT ||
++          format == VK_FORMAT_D32_SFLOAT_S8_UINT ||
++          format == VK_FORMAT_S8_UINT;
++}
++
++static uint32_t
++tu5_stencil_face(const struct vk_stencil_test_face_state *face)
++{
++   return A5XX_RB_STENCIL_CONTROL_STENCIL_ENABLE |
++          A5XX_RB_STENCIL_CONTROL_STENCIL_READ |
++          A5XX_RB_STENCIL_CONTROL_FUNC(face->op.compare) |
++          A5XX_RB_STENCIL_CONTROL_FAIL(face->op.fail) |
++          A5XX_RB_STENCIL_CONTROL_ZPASS(face->op.pass) |
++          A5XX_RB_STENCIL_CONTROL_ZFAIL(face->op.depth_fail);
++}
++
++static uint32_t
++tu5_stencil_refmask(const struct vk_stencil_test_face_state *face)
++{
++   return A5XX_RB_STENCILREFMASK_STENCILREF(face->reference) |
++          A5XX_RB_STENCILREFMASK_STENCILMASK(face->compare_mask) |
++          A5XX_RB_STENCILREFMASK_STENCILWRITEMASK(face->write_mask);
++}
++
++/* Values match enum adreno_rb_blend_factor (adreno_common.xml). The a5xx
++ * enum itself is not included here to avoid clashes with the a6xx headers.
++ */
++static uint32_t
++tu5_blend_factor(VkBlendFactor factor)
++{
++   switch (factor) {
++   case VK_BLEND_FACTOR_ZERO: return 0;
++   case VK_BLEND_FACTOR_ONE: return 1;
++   case VK_BLEND_FACTOR_SRC_COLOR: return 4;
++   case VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR: return 5;
++   case VK_BLEND_FACTOR_SRC_ALPHA: return 6;
++   case VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA: return 7;
++   case VK_BLEND_FACTOR_DST_COLOR: return 8;
++   case VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR: return 9;
++   case VK_BLEND_FACTOR_DST_ALPHA: return 10;
++   case VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA: return 11;
++   case VK_BLEND_FACTOR_CONSTANT_COLOR: return 12;
++   case VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR: return 13;
++   case VK_BLEND_FACTOR_CONSTANT_ALPHA: return 14;
++   case VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA: return 15;
++   case VK_BLEND_FACTOR_SRC_ALPHA_SATURATE: return 16;
++   case VK_BLEND_FACTOR_SRC1_COLOR: return 20;
++   case VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR: return 21;
++   case VK_BLEND_FACTOR_SRC1_ALPHA: return 22;
++   case VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA: return 23;
++   default: return 0;
++   }
++}
++
++/* Values match enum a3xx_rb_blend_opcode. */
++static uint32_t
++tu5_blend_op(VkBlendOp op)
++{
++   switch (op) {
++   case VK_BLEND_OP_ADD: return 0;              /* DST_PLUS_SRC */
++   case VK_BLEND_OP_SUBTRACT: return 1;         /* SRC_MINUS_DST */
++   case VK_BLEND_OP_REVERSE_SUBTRACT: return 2; /* DST_MINUS_SRC */
++   case VK_BLEND_OP_MIN: return 3;
++   case VK_BLEND_OP_MAX: return 4;
++   default: return 0;
++   }
++}
++
++static void
++tu5_emit_zs_disabled(struct tu_cs *cs)
++{
++   tu5_emit_reg(cs, REG_A5XX_RB_DEPTH_CNTL, 0);
++   tu5_emit_reg(cs, REG_A5XX_RB_DEPTH_PLANE_CNTL, 0);
++   tu5_emit_reg(cs, REG_A5XX_GRAS_SU_DEPTH_PLANE_CNTL, 0);
++   tu5_emit_reg(cs, REG_A5XX_RB_DEPTH_BUFFER_INFO,
++                A5XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT(A5EN_DEPTH5_NONE));
++   tu5_emit_reg(cs, REG_A5XX_GRAS_SU_DEPTH_BUFFER_INFO,
++                A5XX_GRAS_SU_DEPTH_BUFFER_INFO_DEPTH_FORMAT(A5EN_DEPTH5_NONE));
++   tu_cs_emit_pkt4(cs, REG_A5XX_RB_DEPTH_FLAG_BUFFER_BASE, 3);
++   tu_cs_emit(cs, 0);
++   tu_cs_emit(cs, 0);
++   tu_cs_emit(cs, 0);
++   tu5_emit_reg(cs, REG_A5XX_RB_STENCIL_INFO, 0);
++   tu5_emit_reg(cs, REG_A5XX_RB_STENCIL_CONTROL, 0);
++   tu_cs_emit_pkt4(cs, REG_A5XX_RB_STENCILREFMASK, 2);
++   tu_cs_emit(cs, 0);
++   tu_cs_emit(cs, 0);
++   tu_cs_emit_pkt4(cs, REG_A5XX_GRAS_LRZ_BUFFER_BASE, 3);
++   tu_cs_emit(cs, 0);
++   tu_cs_emit(cs, 0);
++   tu_cs_emit(cs, A5XX_GRAS_LRZ_BUFFER_PITCH(0));
++   tu_cs_emit_pkt4(cs, REG_A5XX_GRAS_LRZ_FAST_CLEAR_BUFFER_BASE, 2);
++   tu_cs_emit(cs, 0);
++   tu_cs_emit(cs, 0);
++   tu5_emit_reg(cs, REG_A5XX_GRAS_LRZ_CNTL, 0);
++}
++
++/* Depth/stencil images are always tiled on a5xx (the hardware does not
++ * support linear D/S), and RB_DEPTH_BUFFER_INFO has no tile-mode field, so
++ * the implicit tiled layout is what the hardware expects here.
++ */
++static void
++tu5_emit_zs(struct tu_cmd_buffer *cmd,
++            const struct ir3_shader_variant *fs)
++{
++   struct tu_cs *cs = &cmd->cs;
++   const struct vk_dynamic_graphics_state *dyn =
++      &cmd->vk.dynamic_graphics_state;
++   const struct tu_subpass *subpass = cmd->state.subpass;
++   const struct tu_image_view *iview = NULL;
++
++   if (subpass &&
++       subpass->depth_stencil_attachment.attachment != VK_ATTACHMENT_UNUSED) {
++      iview = cmd->state.attachments[
++         subpass->depth_stencil_attachment.attachment];
++   }
++
++   if (!iview) {
++      tu5_emit_zs_disabled(cs);
++      return;
++   }
++
++   VkFormat format = iview->vk.format;
++   uint32_t depth_format = tu5_depth_format(format);
++   const struct fdl6_view *dview =
++      iview->view_depth ? iview->view_depth : &iview->view;
++   bool has_stencil = tu5_format_has_stencil(format);
++   bool separate_stencil =
++      format == VK_FORMAT_D32_SFLOAT_S8_UINT ||
++      format == VK_FORMAT_S8_UINT;
++   const struct fdl6_view *sview =
++      has_stencil ? (iview->view_stencil ? iview->view_stencil : &iview->view)
++                  : NULL;
++
++   if (tu5_gfx_debug()) {
++      fprintf(stderr,
++              "  zs: fmt=%d depth_fmt=%u base=%" PRIx64 " pitch=%u layer=%u"
++              " stencil=%d sep=%d test=%d write=%d cmp=%u\n",
++              format, depth_format, dview->base_addr, dview->pitch,
++              dview->layer_size, has_stencil, separate_stencil,
++              dyn->ds.depth.test_enable, dyn->ds.depth.write_enable,
++              dyn->ds.depth.compare_op);
++   }
++
++   tu_cs_emit_pkt4(cs, REG_A5XX_RB_DEPTH_BUFFER_INFO, 5);
++   tu_cs_emit(cs, A5XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT(depth_format));
++   tu_cs_emit_qw(cs, dview->base_addr);
++   tu_cs_emit(cs, A5XX_RB_DEPTH_BUFFER_PITCH(dview->pitch));
++   tu_cs_emit(cs, A5XX_RB_DEPTH_BUFFER_ARRAY_PITCH(dview->layer_size));
++
++   tu5_emit_reg(cs, REG_A5XX_GRAS_SU_DEPTH_BUFFER_INFO,
++                A5XX_GRAS_SU_DEPTH_BUFFER_INFO_DEPTH_FORMAT(depth_format));
++
++   tu_cs_emit_pkt4(cs, REG_A5XX_RB_DEPTH_FLAG_BUFFER_BASE, 3);
++   tu_cs_emit(cs, 0);
++   tu_cs_emit(cs, 0);
++   tu_cs_emit(cs, 0);
++
++   tu_cs_emit_pkt4(cs, REG_A5XX_GRAS_LRZ_BUFFER_BASE, 3);
++   tu_cs_emit(cs, 0);
++   tu_cs_emit(cs, 0);
++   tu_cs_emit(cs, A5XX_GRAS_LRZ_BUFFER_PITCH(0));
++   tu_cs_emit_pkt4(cs, REG_A5XX_GRAS_LRZ_FAST_CLEAR_BUFFER_BASE, 2);
++   tu_cs_emit(cs, 0);
++   tu_cs_emit(cs, 0);
++   tu5_emit_reg(cs, REG_A5XX_GRAS_LRZ_CNTL, 0);
++
++   if (sview) {
++      tu_cs_emit_pkt4(cs, REG_A5XX_RB_STENCIL_INFO, 5);
++      tu_cs_emit(cs, separate_stencil ?
++                   A5XX_RB_STENCIL_INFO_SEPARATE_STENCIL : 0);
++      tu_cs_emit_qw(cs, sview->base_addr);
++      tu_cs_emit(cs, A5XX_RB_STENCIL_PITCH(sview->pitch));
++      tu_cs_emit(cs, A5XX_RB_STENCIL_ARRAY_PITCH(sview->layer_size));
++   } else {
++      tu5_emit_reg(cs, REG_A5XX_RB_STENCIL_INFO, 0);
++   }
++
++   uint32_t depth_cntl =
++      A5XX_RB_DEPTH_CNTL_ZFUNC(dyn->ds.depth.compare_op);
++   if (dyn->ds.depth.test_enable)
++      depth_cntl |= A5XX_RB_DEPTH_CNTL_Z_TEST_ENABLE |
++                    A5XX_RB_DEPTH_CNTL_Z_READ_ENABLE;
++   if (dyn->ds.depth.write_enable)
++      depth_cntl |= A5XX_RB_DEPTH_CNTL_Z_WRITE_ENABLE;
++   tu5_emit_reg(cs, REG_A5XX_RB_DEPTH_CNTL, depth_cntl);
++
++   bool fragz = fs->writes_pos;
++   tu5_emit_reg(cs, REG_A5XX_RB_DEPTH_PLANE_CNTL,
++                COND(fragz, A5XX_RB_DEPTH_PLANE_CNTL_FRAG_WRITES_Z));
++   tu5_emit_reg(cs, REG_A5XX_GRAS_SU_DEPTH_PLANE_CNTL,
++                COND(fragz, A5XX_GRAS_SU_DEPTH_PLANE_CNTL_FRAG_WRITES_Z));
++
++   if (dyn->ds.stencil.test_enable && sview) {
++      tu5_emit_reg(cs, REG_A5XX_RB_STENCIL_CONTROL,
++         tu5_stencil_face(&dyn->ds.stencil.front) |
++         A5XX_RB_STENCIL_CONTROL_STENCIL_ENABLE_BF |
++         A5XX_RB_STENCIL_CONTROL_FUNC_BF(
++            dyn->ds.stencil.back.op.compare) |
++         A5XX_RB_STENCIL_CONTROL_FAIL_BF(
++            dyn->ds.stencil.back.op.fail) |
++         A5XX_RB_STENCIL_CONTROL_ZPASS_BF(
++            dyn->ds.stencil.back.op.pass) |
++         A5XX_RB_STENCIL_CONTROL_ZFAIL_BF(
++            dyn->ds.stencil.back.op.depth_fail));
++      tu_cs_emit_pkt4(cs, REG_A5XX_RB_STENCILREFMASK, 2);
++      tu_cs_emit(cs, tu5_stencil_refmask(&dyn->ds.stencil.front));
++      tu_cs_emit(cs, tu5_stencil_refmask(&dyn->ds.stencil.back));
++   } else {
++      tu5_emit_reg(cs, REG_A5XX_RB_STENCIL_CONTROL, 0);
++      tu_cs_emit_pkt4(cs, REG_A5XX_RB_STENCILREFMASK, 2);
++      tu_cs_emit(cs, 0);
++      tu_cs_emit(cs, 0);
++   }
++}
++
 +static void
 +tu5_emit_rasterizer(struct tu_cmd_buffer *cmd,
 +                    const struct tu_shader *vs_shader,
@@ -4317,49 +4998,52 @@ index 0000000..394fede
 +   tu_cs_emit(cs, 0);
 +   tu_cs_emit(cs, 0);
 +
++   /* POLYMODE describes how polygons are filled (polygonMode), not the
++    * primitive topology - the draw packet carries the topology.
++    */
++   uint32_t ptype = PC_DRAW_TRIANGLES;
++   switch (dyn->rs.polygon_mode) {
++   case VK_POLYGON_MODE_LINE:
++      ptype = PC_DRAW_LINES;
++      break;
++   case VK_POLYGON_MODE_POINT:
++      ptype = PC_DRAW_POINTS;
++      break;
++   default:
++      break;
++   }
 +   tu5_emit_reg(cs, REG_A5XX_PC_RASTER_CNTL,
-+      A5XX_PC_RASTER_CNTL_POLYMODE_FRONT_PTYPE(PC_DRAW_TRIANGLES) |
-+      A5XX_PC_RASTER_CNTL_POLYMODE_BACK_PTYPE(PC_DRAW_TRIANGLES));
++      A5XX_PC_RASTER_CNTL_POLYMODE_FRONT_PTYPE(ptype) |
++      A5XX_PC_RASTER_CNTL_POLYMODE_BACK_PTYPE(ptype) |
++      COND(dyn->rs.polygon_mode != VK_POLYGON_MODE_FILL,
++           A5XX_PC_RASTER_CNTL_POLYMODE_ENABLE));
 +
 +   tu5_emit_reg(cs, REG_A5XX_PC_PRIMITIVE_CNTL,
 +      A5XX_PC_PRIMITIVE_CNTL_PROVOKING_VTX_LAST |
 +      A5XX_PC_PRIMITIVE_CNTL_STRIDE_IN_VPC(max_loc));
 +
-+   tu5_emit_reg(cs, REG_A5XX_GRAS_CL_CNTL, 0);
++   /* fd5 disables guardband clipping for points and lines: the clip codes
++    * of a point whose centre is outside the guardband would otherwise cull
++    * it entirely, even when the point itself overlaps the viewport.
++    */
++   bool point_or_line =
++      dyn->ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST ||
++      dyn->ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST ||
++      dyn->ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
++   tu5_emit_reg(cs, REG_A5XX_GRAS_CL_CNTL,
++                COND(point_or_line, A5XX_GRAS_CL_CNTL_VP_CLIP_CODE_IGNORE));
 +   tu5_emit_reg(cs, REG_A5XX_GRAS_CL_GUARDBAND_CLIP_ADJ, 0);
 +
 +   tu5_emit_reg(cs, REG_A5XX_RB_ALPHA_CONTROL, 0);
-+   tu5_emit_reg(cs, REG_A5XX_RB_STENCIL_CONTROL, 0);
-+   tu_cs_emit_pkt4(cs, REG_A5XX_RB_STENCILREFMASK, 2);
-+   tu_cs_emit(cs, 0);
-+   tu_cs_emit(cs, 0);
++   tu5_emit_zs(cmd, fs);
 +
-+   tu5_emit_reg(cs, REG_A5XX_RB_DEPTH_CNTL, 0);
-+   tu5_emit_reg(cs, REG_A5XX_RB_DEPTH_PLANE_CNTL, 0);
-+   tu5_emit_reg(cs, REG_A5XX_GRAS_SU_DEPTH_PLANE_CNTL, 0);
-+   tu5_emit_reg(cs, REG_A5XX_RB_DEPTH_BUFFER_INFO,
-+                A5XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT(A5EN_DEPTH5_NONE));
-+   tu5_emit_reg(cs, REG_A5XX_GRAS_SU_DEPTH_BUFFER_INFO,
-+                A5XX_GRAS_SU_DEPTH_BUFFER_INFO_DEPTH_FORMAT(A5EN_DEPTH5_NONE));
-+   tu_cs_emit_pkt4(cs, REG_A5XX_RB_DEPTH_FLAG_BUFFER_BASE, 3);
-+   tu_cs_emit(cs, 0);
-+   tu_cs_emit(cs, 0);
-+   tu_cs_emit(cs, 0);
-+   tu5_emit_reg(cs, REG_A5XX_RB_STENCIL_INFO, 0);
-+   tu_cs_emit_pkt4(cs, REG_A5XX_GRAS_LRZ_BUFFER_BASE, 3);
-+   tu_cs_emit(cs, 0);
-+   tu_cs_emit(cs, 0);
-+   tu_cs_emit(cs, A5XX_GRAS_LRZ_BUFFER_PITCH(0));
-+   tu_cs_emit_pkt4(cs, REG_A5XX_GRAS_LRZ_FAST_CLEAR_BUFFER_BASE, 2);
-+   tu_cs_emit(cs, 0);
-+   tu_cs_emit(cs, 0);
-+
-+   uint32_t nr = 1;
 +   uint32_t posz_regid = ir3_find_output_regid(fs, FRAG_RESULT_DEPTH);
 +   uint32_t smask_regid = ir3_find_output_regid(fs, FRAG_RESULT_SAMPLE_MASK);
 +   bool writes_smask = fs->writes_smask;
 +   if (!writes_smask)
 +      smask_regid = regid(63, 0);
++
++   unsigned nr = MIN2(cmd->state.subpass->color_count, 8u);
 +
 +   tu5_emit_reg(cs, REG_A5XX_RB_FS_OUTPUT_CNTL,
 +      A5XX_RB_FS_OUTPUT_CNTL_MRT(nr) |
@@ -4370,19 +5054,98 @@ index 0000000..394fede
 +      A5XX_SP_FS_OUTPUT_CNTL_DEPTH_REGID(posz_regid) |
 +      A5XX_SP_FS_OUTPUT_CNTL_SAMPLEMASK_REGID(smask_regid));
 +
-+   tu5_emit_reg(cs, REG_A5XX_RB_RENDER_COMPONENTS,
-+      A5XX_RB_RENDER_COMPONENTS_RT0(0xf));
++
++
++   uint32_t blend_mask = 0;
 +
 +   for (unsigned i = 0; i < 8; i++) {
-+      uint32_t control = i == 0 ?
++      const struct vk_color_blend_attachment_state *cba =
++         &dyn->cb.attachments[i];
++      bool used = i < nr;
++      uint32_t mrt_control = used ?
 +         A5XX_RB_MRT_CONTROL_ROP_CODE(ROP_COPY) |
-+         A5XX_RB_MRT_CONTROL_COMPONENT_ENABLE(0xf) : 0;
-+      tu5_emit_reg(cs, REG_A5XX_RB_MRT_CONTROL(i), control);
-+      tu5_emit_reg(cs, REG_A5XX_RB_MRT_BLEND_CONTROL(i), 0);
++         A5XX_RB_MRT_CONTROL_COMPONENT_ENABLE(cba->write_mask) : 0;
++      uint32_t blend_control = 0;
++
++      if (used && cba->blend_enable) {
++         blend_control =
++            A5XX_RB_MRT_BLEND_CONTROL_RGB_SRC_FACTOR(
++               tu5_blend_factor((VkBlendFactor)cba->src_color_blend_factor)) |
++            A5XX_RB_MRT_BLEND_CONTROL_RGB_BLEND_OPCODE(
++               tu5_blend_op(cba->color_blend_op)) |
++            A5XX_RB_MRT_BLEND_CONTROL_RGB_DEST_FACTOR(
++               tu5_blend_factor((VkBlendFactor)cba->dst_color_blend_factor)) |
++            A5XX_RB_MRT_BLEND_CONTROL_ALPHA_SRC_FACTOR(
++               tu5_blend_factor((VkBlendFactor)cba->src_alpha_blend_factor)) |
++            A5XX_RB_MRT_BLEND_CONTROL_ALPHA_BLEND_OPCODE(
++               tu5_blend_op(cba->alpha_blend_op)) |
++            A5XX_RB_MRT_BLEND_CONTROL_ALPHA_DEST_FACTOR(
++               tu5_blend_factor((VkBlendFactor)cba->dst_alpha_blend_factor));
++         mrt_control |= A5XX_RB_MRT_CONTROL_BLEND |
++                        A5XX_RB_MRT_CONTROL_BLEND2;
++         blend_mask |= 1u << i;
++      }
++
++      tu5_emit_reg(cs, REG_A5XX_RB_MRT_CONTROL(i), mrt_control);
++      tu5_emit_reg(cs, REG_A5XX_RB_MRT_BLEND_CONTROL(i), blend_control);
 +   }
 +
-+   tu5_emit_reg(cs, REG_A5XX_SP_BLEND_CNTL, A5XX_SP_BLEND_CNTL_UNK8);
-+   tu5_emit_reg(cs, REG_A5XX_RB_BLEND_CNTL, 0);
++   /* A zero sample mask means no covered samples, so the FS would never be
++    * launched. Default to all 16 samples like the blob does.
++    */
++   uint32_t sample_mask = dyn->ms.sample_mask & 0xffff;
++   if (!sample_mask)
++      sample_mask = 0xffff;
++   tu5_emit_reg(cs, REG_A5XX_SP_BLEND_CNTL,
++                A5XX_SP_BLEND_CNTL_ENABLE_BLEND(blend_mask) |
++                COND(blend_mask != 0, A5XX_SP_BLEND_CNTL_UNK8));
++   tu5_emit_reg(cs, REG_A5XX_RB_BLEND_CNTL,
++                A5XX_RB_BLEND_CNTL_ENABLE_BLEND(blend_mask) |
++                A5XX_RB_BLEND_CNTL_SAMPLE_MASK(sample_mask));
++
++   /* Blend constants: each channel has a float16/uint/sint word followed by
++    * a float32 word. Reuse the RF/BL/AL register names for the second word,
++    * exactly like fd5 does.
++    */
++   for (unsigned i = 0; i < 4; i++) {
++      float c = dyn->cb.blend_constants[i];
++      uint32_t packed =
++         (i == 0 ? A5XX_RB_BLEND_RED_FLOAT(c) :
++          i == 1 ? A5XX_RB_BLEND_GREEN_FLOAT(c) :
++          i == 2 ? A5XX_RB_BLEND_BLUE_FLOAT(c) :
++                   A5XX_RB_BLEND_ALPHA_FLOAT(c)) |
++         (i == 0 ? A5XX_RB_BLEND_RED_UINT((uint32_t)(CLAMP(c, 0.f, 1.f) * 0xff)) :
++          i == 1 ? A5XX_RB_BLEND_GREEN_UINT((uint32_t)(CLAMP(c, 0.f, 1.f) * 0xff)) :
++          i == 2 ? A5XX_RB_BLEND_BLUE_UINT((uint32_t)(CLAMP(c, 0.f, 1.f) * 0xff)) :
++                   A5XX_RB_BLEND_ALPHA_UINT((uint32_t)(CLAMP(c, 0.f, 1.f) * 0xff))) |
++         (i == 0 ? A5XX_RB_BLEND_RED_SINT((uint32_t)(CLAMP(c, -1.f, 1.f) * 0x7f)) :
++          i == 1 ? A5XX_RB_BLEND_GREEN_SINT((uint32_t)(CLAMP(c, -1.f, 1.f) * 0x7f)) :
++          i == 2 ? A5XX_RB_BLEND_BLUE_SINT((uint32_t)(CLAMP(c, -1.f, 1.f) * 0x7f)) :
++                   A5XX_RB_BLEND_ALPHA_SINT((uint32_t)(CLAMP(c, -1.f, 1.f) * 0x7f)));
++      tu_cs_emit_pkt4(cs, REG_A5XX_RB_BLEND_RED + 2 * i, 2);
++      tu_cs_emit(cs, packed);
++      tu_cs_emit(cs, fui(c));
++   }
++}
++
++static void
++tu5_dump_cs(struct tu_cmd_buffer *cmd)
++{
++   struct tu_cs *cs = &cmd->cs;
++   FILE *f = fopen("/tmp/tu5_cs.txt", "w");
++   if (!f)
++      return;
++
++   uint32_t idx = 0;
++   for (uint32_t e = 0; e < cs->entry_count; e++) {
++      const struct tu_cs_entry *entry = &cs->entries[e];
++      const uint32_t *p = (const uint32_t *)entry->bo->map + entry->offset / 4;
++      for (uint32_t i = 0; i < entry->size / 4; i++)
++         fprintf(f, "%u %08x\n", idx++, p[i]);
++   }
++   for (const uint32_t *p = cs->start; p < cs->cur; p++)
++      fprintf(f, "%u %08x\n", idx++, *p);
++   fclose(f);
 +}
 +
 +void
@@ -4397,8 +5160,23 @@ index 0000000..394fede
 +       !cmd->state.attachments[0])
 +      return;
 +
-+   const struct tu_image_view *iview = cmd->state.attachments[0];
++   const struct tu_subpass *subpass = cmd->state.subpass;
++   const struct tu_image_view *iviews[8] = {};
++   unsigned nr = 0;
 +
++   for (unsigned i = 0; subpass && i < MIN2(subpass->color_count, 8u); i++) {
++      uint32_t att = subpass->color_attachments[i].attachment;
++      if (att == VK_ATTACHMENT_UNUSED)
++         continue;
++      iviews[i] = cmd->state.attachments[att];
++      if (iviews[i])
++         nr = i + 1;
++   }
++
++   if (!nr)
++      return;
++
++   const struct tu_image_view *iview = iviews[0];
 +   if (tu5_gfx_debug()) {
 +      const struct ir3_shader_variant *vs_dbg = vs_shader->variant;
 +      const struct ir3_shader_variant *fs_dbg = fs_shader->variant;
@@ -4436,8 +5214,11 @@ index 0000000..394fede
 +   }
 +
 +   uint32_t num_sp_cores = cmd->device->physical_device->info->num_sp_cores;
++   tu5_emit_global_state(cmd);
 +   if (!tu5_gfx_no_invalidate()) {
 +      tu5_event_write(cs, PC_CCU_INVALIDATE_COLOR);
++      if (tu5_has_depth_attachment(cmd))
++         tu5_event_write(cs, PC_CCU_INVALIDATE_DEPTH);
 +      tu_cs_emit_pkt7(cs, CP_WAIT_FOR_IDLE, 0);
 +   }
 +   tu5_emit_reg(cs, REG_A5XX_PC_POWER_CNTL, num_sp_cores - 1);
@@ -4461,20 +5242,31 @@ index 0000000..394fede
 +   tu_cs_emit(cs, A5XX_GRAS_SC_DEST_MSAA_CNTL_SAMPLES(MSAA_ONE) |
 +                  A5XX_GRAS_SC_DEST_MSAA_CNTL_MSAA_DISABLE);
 +
-+   tu5_emit_mrt(cmd, iview, fb->width, fb->height);
++   tu5_emit_mrt(cmd, iviews, nr);
 +   if (tu5_gfx_clear())
 +      tu5_emit_clear(cmd, 0xff0000ffu);
 +   tu5_emit_viewport(cmd, fb->width, fb->height);
++   if (tu5_gfx_debug()) {
++      fprintf(stderr, "  link: cnt=%u max_loc=%u var0={regid=0x%x compmask=0x%x loc=%u} var1={regid=0x%x compmask=0x%x loc=%u} pos_loc=%u psize_loc=%u\n",
++              linkage.cnt, linkage.max_loc,
++              linkage.var[0].regid, linkage.var[0].compmask, linkage.var[0].loc,
++              linkage.var[1].regid, linkage.var[1].compmask, linkage.var[1].loc,
++              pos_loc, psize_loc);
++   }
 +   tu5_emit_program(cmd, vs_shader, fs_shader, &linkage, pos_loc, psize_loc);
 +   tu5_emit_vs_driver_params(cmd, vs_shader, info);
-+   tu5_emit_vertex_inputs(cmd, vs_shader);
++   tu5_emit_gfx_ssbo_state(cmd, vs_shader, SB4_VS_SHADER);
++   tu5_emit_gfx_ssbo_state(cmd, fs_shader, SB4_FS_SHADER);
 +   tu5_emit_rasterizer(cmd, vs_shader, fs_shader, linkage.max_loc);
++   tu5_emit_vertex_inputs(cmd, vs_shader);
 +
 +   tu5_emit_reg(cs, REG_A5XX_VPC_SO_OVERRIDE, 0);
-+   tu_cs_emit_pkt7(cs, CP_SET_VISIBILITY_OVERRIDE, 1);
-+   tu_cs_emit(cs, 0x1);
-+   tu_cs_emit_pkt7(cs, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
-+   tu_cs_emit(cs, 0x0);
++   if (!getenv("TU5_GFX_NOVIS")) {
++      tu_cs_emit_pkt7(cs, CP_SET_VISIBILITY_OVERRIDE, 1);
++      tu_cs_emit(cs, 0x1);
++      tu_cs_emit_pkt7(cs, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
++      tu_cs_emit(cs, 0x0);
++   }
 +
 +   enum pc_di_primtype primtype = DI_PT_TRILIST;
 +   uint32_t topology = cmd->vk.dynamic_graphics_state.ia.primitive_topology;
@@ -4495,9 +5287,6 @@ index 0000000..394fede
 +      break;
 +   }
 +
-+   tu5_emit_reg(cs, REG_A5XX_RB_RENDER_CNTL, 0x8);
-+   tu5_emit_reg(cs, REG_A5XX_GRAS_SC_CNTL, 0x8);
-+
 +   tu_cs_emit_pkt4(cs, REG_A5XX_VFD_INDEX_OFFSET, 2);
 +   tu_cs_emit(cs, info->indexed ? (uint32_t)info->vertex_offset
 +                                : info->first_vertex);
@@ -4505,8 +5294,15 @@ index 0000000..394fede
 +
 +   tu5_emit_reg(cs, REG_A5XX_PC_RESTART_INDEX, 0xffffffff);
 +
++   uint32_t rb_rc = getenv("TU5_RB_RC") ? strtoul(getenv("TU5_RB_RC"), NULL, 0) : 0x8;
++   uint32_t gras_sc = getenv("TU5_GRAS_SC") ? strtoul(getenv("TU5_GRAS_SC"), NULL, 0) : 0x8;
++   tu5_emit_reg(cs, REG_A5XX_RB_RENDER_CNTL, rb_rc);
++   tu5_emit_reg(cs, REG_A5XX_GRAS_SC_CNTL, gras_sc);
++
++   enum pc_di_vis_cull_mode vismode = getenv("TU5_GFX_VIS1") ?
++      USE_VISIBILITY : IGNORE_VISIBILITY;
 +   uint32_t initiator = CP_DRAW_INDX_OFFSET_0_PRIM_TYPE(primtype) |
-+                        CP_DRAW_INDX_OFFSET_0_VIS_CULL(IGNORE_VISIBILITY);
++                        CP_DRAW_INDX_OFFSET_0_VIS_CULL(vismode);
 +
 +   if (info->indexed) {
 +      enum a4xx_index_size index_size;
@@ -4536,15 +5332,30 @@ index 0000000..394fede
 +
 +   if (getenv("TU5_GFX_POSTCLEAR"))
 +      tu5_emit_clear(cmd, 0x00ff00ffu);
-+   if (!tu5_gfx_no_flush())
++   if (!tu5_gfx_no_flush()) {
 +      tu5_ccu_flush_color(cmd);
++      if (tu5_has_depth_attachment(cmd))
++         tu5_ccu_flush_depth(cmd);
++   }
++
++   /* Flush UCHE/CCU writes so CPU readback sees them (same sequence as the
++    * a5xx compute path).
++    */
++   tu_cs_emit_pkt7(cs, CP_EVENT_WRITE, 4);
++   tu_cs_emit(cs, CP_EVENT_WRITE_0_EVENT(CACHE_FLUSH_TS));
++   tu_cs_emit_qw(cs, global_iova(cmd, seqno_dummy));
++   tu_cs_emit(cs, 0);
++   tu_cs_emit_pkt7(cs, CP_WAIT_FOR_IDLE, 0);
++
++   if (getenv("TU5_GFX_DUMPCS"))
++      tu5_dump_cs(cmd);
 +}
 diff --git a/src/freedreno/vulkan/tu5_graphics.h b/src/freedreno/vulkan/tu5_graphics.h
 new file mode 100644
-index 0000000..5452ec1
+index 0000000..e1bb992
 --- /dev/null
 +++ b/src/freedreno/vulkan/tu5_graphics.h
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,35 @@
 +/*
 + * Copyright © 2026 Mesa contributors
 + * SPDX-License-Identifier: MIT
@@ -4574,9 +5385,14 @@ index 0000000..5452ec1
 +
 +void tu5_draw(struct tu_cmd_buffer *cmd, const struct tu5_draw_info *info);
 +
++/* Apply the render-pass loadOp=CLEAR for color attachments. a5xx sysmem
++ * rendering has no GMEM, so this is done with a linear memory fill.
++ */
++void tu5_clear_attachments(struct tu_cmd_buffer *cmd);
++
 +#endif /* TU5_GRAPHICS_H */
 diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
-index 612b890..b46b477 100644
+index 612b890..6dfd567 100644
 --- a/src/freedreno/vulkan/tu_cmd_buffer.cc
 +++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
 @@ -18,6 +18,7 @@
@@ -4610,21 +5426,23 @@ index 612b890..b46b477 100644
     cmd->state.dirty |= TU_CMD_DIRTY_DESC_SETS | TU_CMD_DIRTY_SHADER_CONSTS |
                         TU_CMD_DIRTY_VS_PARAMS | TU_CMD_DIRTY_PROGRAM;
  
-@@ -7249,6 +7266,13 @@ tu_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
+@@ -7249,6 +7266,15 @@ tu_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
        }
     }
  
 +   if (cmd->device->physical_device->info->chip == 5) {
 +      /* Minimal sysmem renderpass: attachment pointers and clear values are
-+       * enough, the actual a5xx state is emitted by tu5_draw.
++       * enough, the actual a5xx state is emitted by tu5_draw. Clears are
++       * applied here, since there is no GMEM to do the load op later.
 +       */
++      tu5_clear_attachments(cmd);
 +      return;
 +   }
 +
     tu_choose_gmem_layout(cmd);
  
     /* Note: because this is external, any flushes will happen before draw_cs
-@@ -9263,6 +9287,18 @@ tu_CmdDraw(VkCommandBuffer commandBuffer,
+@@ -9263,6 +9289,18 @@ tu_CmdDraw(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
     struct tu_cs *cs = &cmd->draw_cs;
  
@@ -4643,7 +5461,7 @@ index 612b890..b46b477 100644
     tu6_emit_vs_params(cmd, NULL, 0, firstVertex, firstInstance);
  
     tu6_draw_common<CHIP>(cmd, cs, false, vertexCount);
-@@ -9337,6 +9373,19 @@ tu_CmdDrawIndexed(VkCommandBuffer commandBuffer,
+@@ -9337,6 +9375,19 @@ tu_CmdDrawIndexed(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
     struct tu_cs *cs = &cmd->draw_cs;
  
@@ -4663,7 +5481,7 @@ index 612b890..b46b477 100644
     tu6_emit_vs_params(cmd, NULL, 0, vertexOffset, firstInstance);
  
     tu6_draw_common<CHIP>(cmd, cs, true, indexCount);
-@@ -10414,6 +10463,12 @@ tu_CmdEndRenderPass2(VkCommandBuffer commandBuffer,
+@@ -10414,6 +10465,12 @@ tu_CmdEndRenderPass2(VkCommandBuffer commandBuffer,
        return;
     }
  
@@ -4676,6 +5494,54 @@ index 612b890..b46b477 100644
     const VkRenderPassFragmentDensityMapOffsetEndInfoEXT *fdm_offset_info =
        vk_find_struct_const(pSubpassEndInfo->pNext,
                             RENDER_PASS_FRAGMENT_DENSITY_MAP_OFFSET_END_INFO_EXT);
+diff --git a/src/freedreno/vulkan/tu_formats.cc b/src/freedreno/vulkan/tu_formats.cc
+index 484035a..f1cea9f 100644
+--- a/src/freedreno/vulkan/tu_formats.cc
++++ b/src/freedreno/vulkan/tu_formats.cc
+@@ -430,7 +430,8 @@ tu_GetPhysicalDeviceFormatProperties2(
+       }
+ 
+       /* note: ubwc_possible() argument values to be ignored except for format */
+-      if (pFormatProperties->formatProperties.optimalTilingFeatures &&
++      if (physical_device->info->chip != 5 &&
++          pFormatProperties->formatProperties.optimalTilingFeatures &&
+           tiling_possible(format) &&
+           ubwc_possible(NULL, format, VK_IMAGE_TYPE_2D, 0, 0, 0,
+                         physical_device->info, VK_SAMPLE_COUNT_1_BIT, 1,
+@@ -461,7 +462,8 @@ tu_GetPhysicalDeviceFormatProperties2(
+       }
+ 
+       /* note: ubwc_possible() argument values to be ignored except for format */
+-      if (props3->optimalTilingFeatures &&
++      if (physical_device->info->chip != 5 &&
++          props3->optimalTilingFeatures &&
+           tiling_possible(format) &&
+           ubwc_possible(NULL, format, VK_IMAGE_TYPE_2D, 0, 0, 0,
+                         physical_device->info, VK_SAMPLE_COUNT_1_BIT, 1,
+diff --git a/src/freedreno/vulkan/tu_image.cc b/src/freedreno/vulkan/tu_image.cc
+index 478a63b..198984d 100644
+--- a/src/freedreno/vulkan/tu_image.cc
++++ b/src/freedreno/vulkan/tu_image.cc
+@@ -566,6 +566,19 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
+       force_linear_tile = true;
+    }
+ 
++   /* The a5xx sysmem path only understands linear color images: its MRT
++    * descriptors use TILE5_LINEAR and there is no UBWC support. Depth/stencil
++    * is the exception: the hardware does not support linear D/S (fdl6 also
++    * forces tiling for it), and RB_DEPTH_BUFFER_INFO has no tile-mode field,
++    * so it implicitly expects the tiled layout. Just disable UBWC for it.
++    */
++   if (device->physical_device->info->chip == 5) {
++      ubwc_enabled = false;
++      if (!plane_layouts &&
++          !vk_format_is_depth_or_stencil(image->vk.format))
++         force_linear_tile = true;
++   }
++
+    /* Force linear tiling for HIC usage with swapped formats. Because tiled
+     * images are stored without the swap, we would have to apply the swap when
+     * copying on the CPU, which for some formats is tricky.
 diff --git a/src/freedreno/vulkan/tu_pipeline.cc b/src/freedreno/vulkan/tu_pipeline.cc
 index 5f06dd5..139f7d4 100644
 --- a/src/freedreno/vulkan/tu_pipeline.cc

@@ -1,30 +1,44 @@
-From 92caef46eea022412d063cc953887403dfee85ea Mon Sep 17 00:00:00 2001
-From: opencode <user@example.com>
-Date: Fri, 20 Nov 2026 12:40:20 +0200
-Subject: [PATCH 20/29] turnip/a5xx: WIP bindful textures and TPL1 state
+From 3490401aff10d6b9315adab73d421a7e1249b1db Mon Sep 17 00:00:00 2001
+From: Kulesha Evgeniy <voovdop@gmail.com>
+Date: Sat, 21 Nov 2026 18:18:26 +0200
+Subject: [PATCH 3/9] turnip/a5xx: add bindful TPL1 textures
 
-- Lower sampler2D derefs to bindful TPL1 slots (Vulkan binding == slot)
-  instead of bindless descriptors on chip 5.
-- Emit TPL1 sampler state (4 dwords) and texture state (12 dwords) from
-  the packed A6xx descriptors; the field layout overlaps A5xx TEX_CONST
-  for the fields we need, and chip 5 images are linear.
-- Program the full TPL1_MODE_CNTL value (bank bits + fd5 flags).
+Add bindful texture/sampler state and the TPL1 preload paths used by the a5xx sysmem renderer.  This is the state that later needs to be part of the pipeline-cache blob.
 
-Status: texture sampling itself works - tu5_tex_fc_test samples a
-red/green 64x64 texture correctly via gl_FragCoord. The varying-based
-tu5_tex_test returns a constant (0,0) UV, and a later run hung the GPU;
-a warm reboot did not recover it (needs a full power-off). VPC_VAR_DISABLE
-now matches fd5 (computed before appending POS/PSIZ), but that fix is
-untested. Debug output for FS inputs / VS outputs / linkage is included
-under TU5_GFX_DEBUG.
+Signed-off-by: Kulesha Evgeniy <voovdop@gmail.com>
 ---
- src/freedreno/vulkan/tu5_graphics.cc | 166 ++++++++++++++++++++++++++-
- src/freedreno/vulkan/tu_shader.cc    |  80 +++++++++++++
+ src/freedreno/vulkan/tu5_compute.cc  |  12 +-
+ src/freedreno/vulkan/tu5_graphics.cc | 234 +++++++++++++++++++++++----
+ src/freedreno/vulkan/tu_shader.cc    | 127 +++++++++++++++
  src/freedreno/vulkan/tu_shader.h     |  10 ++
- 3 files changed, 250 insertions(+), 6 deletions(-)
+ 4 files changed, 344 insertions(+), 39 deletions(-)
 
+diff --git a/src/freedreno/vulkan/tu5_compute.cc b/src/freedreno/vulkan/tu5_compute.cc
+index 811208a..ddd40eb 100644
+--- a/src/freedreno/vulkan/tu5_compute.cc
++++ b/src/freedreno/vulkan/tu5_compute.cc
+@@ -44,13 +44,13 @@ tu5_emit_cs_config(struct tu_cs *cs,
+    const struct ir3_info *info = &v->info;
+    enum tu5_threadsize thrsz =
+       info->double_threadsize ? TU5_FOUR_QUADS : TU5_TWO_QUADS;
+-   unsigned instrlen = v->instrlen;
+-
+-   /* If the shader is larger than 32*16 instructions, don't preload it.
+-    * Mirrors the Gallium a5xx compute path.
++   /* Do not preload compute shaders into the shared internal instruction
++    * store: a preloaded graphics pipeline leaves its VS/FS there, and a
++    * subsequent preloaded compute dispatch was observed to read 0 instead
++    * of the SSBO values.  External fetch works reliably; keep it.
+     */
+-   if (instrlen > 32)
+-      instrlen = 0;
++   unsigned instrlen = 0;
++   (void)v->instrlen;
+ 
+    tu_cs_emit_pkt4(cs, TU5_REG_SP_SP_CNTL, 1);
+    tu_cs_emit(cs, 0);
 diff --git a/src/freedreno/vulkan/tu5_graphics.cc b/src/freedreno/vulkan/tu5_graphics.cc
-index 2aa198b..586689c 100644
+index 2aa198b..5809737 100644
 --- a/src/freedreno/vulkan/tu5_graphics.cc
 +++ b/src/freedreno/vulkan/tu5_graphics.cc
 @@ -20,6 +20,7 @@
@@ -35,7 +49,45 @@ index 2aa198b..586689c 100644
  #include "tu_shader.h"
  
  #include "ir3/ir3_shader.h"
-@@ -377,9 +378,21 @@ tu5_emit_program(struct tu_cmd_buffer *cmd,
+@@ -285,8 +286,12 @@ tu5_emit_program(struct tu_cmd_buffer *cmd,
+    s[0].instroff = 0;
+    s[1].instroff = 64 - s[1].instrlen;
+ 
++   /* a5xx requires FOUR_QUADS when the FS uses half registers (for example
++    * an f16 texture sample); TWO_QUADS with half regs hangs the texture unit.
++    */
+    enum a3xx_threadsize fssz =
+-      s[1].info->double_threadsize ? FOUR_QUADS : TWO_QUADS;
++      (s[1].info->double_threadsize || s[1].info->max_half_reg >= 0) ?
++      FOUR_QUADS : TWO_QUADS;
+ 
+    uint32_t pos_regid = ir3_find_output_regid(vs, VARYING_SLOT_POS);
+    uint32_t psize_regid = ir3_find_output_regid(vs, VARYING_SLOT_PSIZ);
+@@ -317,7 +322,12 @@ tu5_emit_program(struct tu_cmd_buffer *cmd,
+       ir3_find_sysval_regid(fs, SYSTEM_VALUE_SAMPLE_MASK_IN);
+    uint32_t face_regid = ir3_find_sysval_regid(fs, SYSTEM_VALUE_FRONT_FACE);
+    uint32_t coord_regid = ir3_find_sysval_regid(fs, SYSTEM_VALUE_FRAG_COORD);
+-   uint32_t zwcoord_regid = coord_regid + 2;
++   /* Keep the invalid regid for unused sysvals: 0 would mean r0 and the
++    * hardware would write several sysvals into the same register, clobbering
++    * the barycentric IJ values.
++    */
++   uint32_t zwcoord_regid = VALIDREG(coord_regid) ? coord_regid + 2
++                                                  : regid(63, 0);
+    uint32_t ij_regid[IJ_COUNT];
+    for (unsigned i = 0; i < ARRAY_SIZE(ij_regid); i++)
+       ij_regid[i] = ir3_find_sysval_regid(
+@@ -364,7 +374,8 @@ tu5_emit_program(struct tu_cmd_buffer *cmd,
+    tu_cs_emit(cs, s[1].instrlen);
+ 
+    tu5_emit_reg(cs, REG_A5XX_SP_VS_CTRL_REG0,
+-      A5XX_SP_VS_CTRL_REG0_HALFREGFOOTPRINT(s[0].info->max_half_reg + 1) |
++      A5XX_SP_VS_CTRL_REG0_HALFREGFOOTPRINT(
++         MAX2(s[0].info->max_half_reg + 1, 1)) |
+       A5XX_SP_VS_CTRL_REG0_FULLREGFOOTPRINT(s[0].info->max_reg + 1) |
+       COND(s[0].instrlen != 0, A5XX_SP_VS_CTRL_REG0_BUFFER) |
+       0x2 |
+@@ -377,9 +388,21 @@ tu5_emit_program(struct tu_cmd_buffer *cmd,
     (void)pos_loc_final;
     (void)psize_loc_final;
  
@@ -58,7 +110,83 @@ index 2aa198b..586689c 100644
  
     for (unsigned i = 0, j = 0; i < 16 && j < linkage->cnt; i++) {
        uint32_t reg = A5XX_SP_VS_OUT_REG_A_REGID(linkage->var[j].regid) |
-@@ -901,6 +914,15 @@ tu5_emit_global_state(struct tu_cmd_buffer *cmd)
+@@ -422,30 +445,24 @@ tu5_emit_program(struct tu_cmd_buffer *cmd,
+                   A5XX_HLSQ_CONTROL_0_REG_CSTHREADSIZE(TWO_QUADS) |
+                   0x00000880);
+    tu_cs_emit(cs, A5XX_HLSQ_CONTROL_1_REG_PRIMALLOCTHRESHOLD(63));
++   /* These HLSQ fields carry raw register ids, not booleans. Unused sysvals
++    * must be encoded as r63.x (0xfc), as fd5 does, not as 0 (= r0).
++    */
+    tu_cs_emit(cs,
+-      CONDREG(face_regid, A5XX_HLSQ_CONTROL_2_REG_FACEREGID(face_regid)) |
+-      CONDREG(samp_id_regid, A5XX_HLSQ_CONTROL_2_REG_SAMPLEID(samp_id_regid)) |
+-      CONDREG(samp_mask_regid,
+-              A5XX_HLSQ_CONTROL_2_REG_SAMPLEMASK(samp_mask_regid)) |
+-      CONDREG(ij_regid[IJ_PERSP_CENTER_RHW],
+-              A5XX_HLSQ_CONTROL_2_REG_CENTERRHW(
+-                 ij_regid[IJ_PERSP_CENTER_RHW])));
++      A5XX_HLSQ_CONTROL_2_REG_FACEREGID(face_regid) |
++      A5XX_HLSQ_CONTROL_2_REG_SAMPLEID(samp_id_regid) |
++      A5XX_HLSQ_CONTROL_2_REG_SAMPLEMASK(samp_mask_regid) |
++      A5XX_HLSQ_CONTROL_2_REG_CENTERRHW(ij_regid[IJ_PERSP_CENTER_RHW]));
+    tu_cs_emit(cs,
+-      CONDREG(ij_regid[IJ_PERSP_PIXEL],
+-              A5XX_HLSQ_CONTROL_3_REG_IJ_PERSP_PIXEL(ij_regid[IJ_PERSP_PIXEL])) |
+-      CONDREG(ij_regid[IJ_LINEAR_PIXEL],
+-              A5XX_HLSQ_CONTROL_3_REG_IJ_LINEAR_PIXEL(ij_regid[IJ_LINEAR_PIXEL])) |
+-      CONDREG(ij_regid[IJ_PERSP_CENTROID],
+-              A5XX_HLSQ_CONTROL_3_REG_IJ_PERSP_CENTROID(ij_regid[IJ_PERSP_CENTROID])) |
+-      CONDREG(ij_regid[IJ_LINEAR_CENTROID],
+-              A5XX_HLSQ_CONTROL_3_REG_IJ_LINEAR_CENTROID(ij_regid[IJ_LINEAR_CENTROID])));
++      A5XX_HLSQ_CONTROL_3_REG_IJ_PERSP_PIXEL(ij_regid[IJ_PERSP_PIXEL]) |
++      A5XX_HLSQ_CONTROL_3_REG_IJ_LINEAR_PIXEL(ij_regid[IJ_LINEAR_PIXEL]) |
++      A5XX_HLSQ_CONTROL_3_REG_IJ_PERSP_CENTROID(ij_regid[IJ_PERSP_CENTROID]) |
++      A5XX_HLSQ_CONTROL_3_REG_IJ_LINEAR_CENTROID(ij_regid[IJ_LINEAR_CENTROID]));
+    tu_cs_emit(cs,
+-      CONDREG(coord_regid, A5XX_HLSQ_CONTROL_4_REG_XYCOORDREGID(coord_regid)) |
+-      CONDREG(coord_regid, A5XX_HLSQ_CONTROL_4_REG_ZWCOORDREGID(zwcoord_regid)) |
+-      CONDREG(ij_regid[IJ_PERSP_SAMPLE],
+-              A5XX_HLSQ_CONTROL_4_REG_IJ_PERSP_SAMPLE(ij_regid[IJ_PERSP_SAMPLE])) |
+-      CONDREG(ij_regid[IJ_LINEAR_SAMPLE],
+-              A5XX_HLSQ_CONTROL_4_REG_IJ_LINEAR_SAMPLE(ij_regid[IJ_LINEAR_SAMPLE])));
++      A5XX_HLSQ_CONTROL_4_REG_XYCOORDREGID(coord_regid) |
++      A5XX_HLSQ_CONTROL_4_REG_ZWCOORDREGID(zwcoord_regid) |
++      A5XX_HLSQ_CONTROL_4_REG_IJ_PERSP_SAMPLE(ij_regid[IJ_PERSP_SAMPLE]) |
++      A5XX_HLSQ_CONTROL_4_REG_IJ_LINEAR_SAMPLE(ij_regid[IJ_LINEAR_SAMPLE]));
+ 
+    tu5_emit_reg(cs, REG_A5XX_SP_FS_CTRL_REG0,
+       COND(getenv("TU5_GFX_FORCE_VARYING") || fs->total_in > 0,
+@@ -453,7 +470,8 @@ tu5_emit_program(struct tu_cmd_buffer *cmd,
+       0x40002 |
+       COND(s[1].instrlen != 0, A5XX_SP_FS_CTRL_REG0_BUFFER) |
+       A5XX_SP_FS_CTRL_REG0_THREADSIZE(fssz) |
+-      A5XX_SP_FS_CTRL_REG0_HALFREGFOOTPRINT(s[1].info->max_half_reg + 1) |
++      A5XX_SP_FS_CTRL_REG0_HALFREGFOOTPRINT(
++         MAX2(s[1].info->max_half_reg + 1, 1)) |
+       A5XX_SP_FS_CTRL_REG0_FULLREGFOOTPRINT(s[1].info->max_reg + 1) |
+       A5XX_SP_FS_CTRL_REG0_BRANCHSTACK(ir3_shader_branchstack_hw(fs)) |
+       COND(fs->need_pixlod, A5XX_SP_FS_CTRL_REG0_PIXLODENABLE));
+@@ -462,7 +480,8 @@ tu5_emit_program(struct tu_cmd_buffer *cmd,
+       fprintf(stderr, "  iova vs=%" PRIx64 " fs=%" PRIx64 "\n",
+               vs_shader->binary_iova, fs_shader->binary_iova);
+       fprintf(stderr, "  vscntl=0x%x fsctrl=0x%x hlsq0=0x%x\n",
+-         A5XX_SP_VS_CTRL_REG0_HALFREGFOOTPRINT(s[0].info->max_half_reg + 1) |
++         A5XX_SP_VS_CTRL_REG0_HALFREGFOOTPRINT(
++            MAX2(s[0].info->max_half_reg + 1, 1)) |
+          A5XX_SP_VS_CTRL_REG0_FULLREGFOOTPRINT(s[0].info->max_reg + 1) |
+          COND(s[0].instrlen != 0, A5XX_SP_VS_CTRL_REG0_BUFFER) | 0x2 |
+          A5XX_SP_VS_CTRL_REG0_BRANCHSTACK(ir3_shader_branchstack_hw(vs)) |
+@@ -470,7 +489,8 @@ tu5_emit_program(struct tu_cmd_buffer *cmd,
+          COND(fs->total_in > 0, A5XX_SP_FS_CTRL_REG0_VARYING) | 0x40002 |
+          COND(s[1].instrlen != 0, A5XX_SP_FS_CTRL_REG0_BUFFER) |
+          A5XX_SP_FS_CTRL_REG0_THREADSIZE(fssz) |
+-         A5XX_SP_FS_CTRL_REG0_HALFREGFOOTPRINT(s[1].info->max_half_reg + 1) |
++         A5XX_SP_FS_CTRL_REG0_HALFREGFOOTPRINT(
++            MAX2(s[1].info->max_half_reg + 1, 1)) |
+          A5XX_SP_FS_CTRL_REG0_FULLREGFOOTPRINT(s[1].info->max_reg + 1) |
+          A5XX_SP_FS_CTRL_REG0_BRANCHSTACK(ir3_shader_branchstack_hw(fs)) |
+          COND(fs->need_pixlod, A5XX_SP_FS_CTRL_REG0_PIXLODENABLE),
+@@ -901,6 +921,17 @@ tu5_emit_global_state(struct tu_cmd_buffer *cmd)
     tu5_emit_reg(cs, REG_A5XX_GRAS_SC_BIN_CNTL, 0);
     tu5_emit_reg(cs, REG_A5XX_GRAS_SU_CONSERVATIVE_RAS_CNTL, 0);
     tu5_emit_reg(cs, REG_A5XX_VPC_FS_PRIMITIVEID_CNTL, 0xff);
@@ -70,11 +198,13 @@ index 2aa198b..586689c 100644
 +   if (hbb >= 13 && hbb <= 16) {
 +      tu5_emit_reg(cs, REG_A5XX_TPL1_MODE_CNTL,
 +                   0x444 | A5XX_TPL1_MODE_CNTL_HIGHESTBANKBIT(hbb - 13));
++      tu5_emit_reg(cs, REG_A5XX_RB_MODE_CNTL,
++                   0x40 | A5XX_RB_MODE_CNTL_HIGHESTBANKBIT(hbb - 13));
 +   }
  }
  
  /* A5xx sysmem rendering has no GMEM, so RB_CLEAR_CNTL cannot be used to
-@@ -1185,6 +1207,127 @@ tu5_emit_mrt(struct tu_cmd_buffer *cmd,
+@@ -1185,6 +1216,132 @@ tu5_emit_mrt(struct tu_cmd_buffer *cmd,
     tu5_emit_reg(cs, REG_A5XX_RB_RENDER_COMPONENTS, components);
  }
  
@@ -103,6 +233,11 @@ index 2aa198b..586689c 100644
 +{
 +   dst[0] = src[0];
 +   dst[1] = src[1] & ~0x1u;
++   /* fd5 uses a small non-zero LOD clamp when mipmapping is off so the HW
++    * can still choose between min and mag filtering of level 0.
++    */
++   if (!(dst[1] & A5XX_TEX_SAMP_1_MAX_LOD__MASK))
++      dst[1] |= A5XX_TEX_SAMP_1_MAX_LOD(0.125f);
 +   dst[2] = 0;
 +   dst[3] = 0;
 +}
@@ -202,7 +337,7 @@ index 2aa198b..586689c 100644
  static void
  tu5_emit_viewport(struct tu_cmd_buffer *cmd, uint32_t width, uint32_t height)
  {
-@@ -1733,6 +1876,11 @@ tu5_draw(struct tu_cmd_buffer *cmd, const struct tu5_draw_info *info)
+@@ -1733,6 +1890,11 @@ tu5_draw(struct tu_cmd_buffer *cmd, const struct tu5_draw_info *info)
                fs_dbg->instrlen, fs_dbg->constlen, fs_dbg->total_in,
                ir3_find_output_regid(fs_dbg, FRAG_RESULT_DATA0),
                ir3_find_output_regid(fs_dbg, FRAG_RESULT_COLOR));
@@ -214,7 +349,7 @@ index 2aa198b..586689c 100644
     }
  
     struct ir3_shader_linkage linkage = {};
-@@ -1785,16 +1933,22 @@ tu5_draw(struct tu_cmd_buffer *cmd, const struct tu5_draw_info *info)
+@@ -1785,16 +1947,22 @@ tu5_draw(struct tu_cmd_buffer *cmd, const struct tu5_draw_info *info)
        tu5_emit_clear(cmd, 0xff0000ffu);
     tu5_emit_viewport(cmd, fb->width, fb->height);
     if (tu5_gfx_debug()) {
@@ -243,10 +378,10 @@ index 2aa198b..586689c 100644
     tu5_emit_vertex_inputs(cmd, vs_shader);
  
 diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
-index 3cd1d54..558148e 100644
+index 3cd1d54..491592c 100644
 --- a/src/freedreno/vulkan/tu_shader.cc
 +++ b/src/freedreno/vulkan/tu_shader.cc
-@@ -1071,12 +1071,73 @@ lower_tex_texel_buffer_to_image(
+@@ -1071,12 +1071,98 @@ lower_tex_texel_buffer_to_image(
     }
  }
  
@@ -254,6 +389,31 @@ index 3cd1d54..558148e 100644
 + * the TPL1 texture/sampler slot and drop the descriptor deref sources. The
 + * driver emits TPL1 state for those slots at draw time.
 + */
++/* a5xx's texture unit returns half-precision values.  A highp Vulkan
++ * shader would otherwise get a "sam (f32)" instruction, which is unreliable
++ * on this generation (observed as zero samples and GPU hangs).  Force the
++ * texture result to f16 and convert back to f32, matching what fd5 does for
++ * mediump shaders.
++ */
++static bool
++tu5_lower_tex_to_f16(nir_builder *b, nir_instr *instr, void *data)
++{
++   if (instr->type != nir_instr_type_tex)
++      return false;
++
++   nir_tex_instr *tex = nir_instr_as_tex(instr);
++   if (tex->dest_type != nir_type_float32)
++      return false;
++
++   tex->def.bit_size = 16;
++   tex->dest_type = nir_type_float16;
++
++   b->cursor = nir_after_instr(&tex->instr);
++   nir_def *cvt = nir_f2f32(b, &tex->def);
++   nir_def_rewrite_uses_after(&tex->def, cvt);
++   return true;
++}
++
 +static bool
 +tu5_lower_bindful_tex(nir_tex_instr *tex, struct tu_shader *shader, bool ref)
 +{
@@ -320,20 +480,49 @@ index 3cd1d54..558148e 100644
     bool descriptor_valid = true;
     int sampler_src_idx = nir_tex_instr_src_index(tex, ref ? nir_tex_src_sampler_2_deref : nir_tex_src_sampler_deref);
     if (sampler_src_idx >= 0) {
-@@ -3975,6 +4036,9 @@ tu_shader_create(struct tu_device *dev,
+@@ -3957,6 +4043,11 @@ tu_shader_create(struct tu_device *dev,
+             key->read_only_input_attachments, key->dynamic_renderpass,
+             &const_allocs);
+ 
++   if (dev->physical_device->info->chip == 5) {
++      NIR_PASS(_, nir, nir_shader_instructions_pass,
++               tu5_lower_tex_to_f16, nir_metadata_none, NULL);
++   }
++
+    if (dev->physical_device->info->chip == 5) {
+       uint32_t size_base =
+          const_allocs.consts[IR3_CONST_ALLOC_SSBO_SIZES].offset_vec4 * 4;
+@@ -3975,6 +4066,14 @@ tu_shader_create(struct tu_device *dev,
  
     nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
  
 +   if (dev->physical_device->info->chip == 5)
 +      nir->info.num_textures = shader->num_textures;
 +
++   if (dev->physical_device->info->chip == 5 && getenv("TU5_GFX_DEBUG")) {
++      fprintf(stderr, "tu5 final nir (stage %u):\n", nir->info.stage);
++      nir_print_shader(nir, stderr);
++   }
++
     struct ir3_shader_nir_options nir_options;
     init_ir3_nir_options(&nir_options, key);
  
-@@ -4018,6 +4082,22 @@ tu_shader_create(struct tu_device *dev,
+@@ -4018,6 +4117,34 @@ tu_shader_create(struct tu_device *dev,
     shader->variant =
        ir3_shader_create_variant(ir3_shader, ir3_key, executable_info);
  
++   if (dev->physical_device->info->chip == 5 && getenv("TU5_DUMP_BIN") &&
++       shader->variant->bin) {
++      const struct ir3_shader_variant *v = shader->variant;
++      char name[64];
++      snprintf(name, sizeof(name), "/tmp/tu5_%u.bin", v->type);
++      FILE *f = fopen(name, "wb");
++      if (f) {
++         fwrite(v->bin, 4, v->info.sizedwords, f);
++         fclose(f);
++      }
++   }
++
 +   if (dev->physical_device->info->chip == 5 && getenv("TU5_GFX_DEBUG")) {
 +      const struct ir3_shader_variant *v = shader->variant;
 +      fprintf(stderr, "tu5 shader stage=%u: inputs=%u outputs=%u total_in=%u"

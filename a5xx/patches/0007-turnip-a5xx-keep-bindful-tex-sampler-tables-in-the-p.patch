@@ -1,0 +1,53 @@
+From 04fdfbf084d8a34912df1e01babf6d0645681171 Mon Sep 17 00:00:00 2001
+From: Kulesha Evgeniy <voovdop@gmail.com>
+Date: Sat, 21 Nov 2026 18:18:27 +0200
+Subject: [PATCH 7/9] turnip/a5xx: keep bindful tex/sampler tables in the
+ pipeline cache blob
+
+tu_shader_cache_process_blob() did not serialize num_textures/tex_map/num_samplers/samp_map.  On a5xx the draw-time TPL1 setup is driven by those tables, so a shader loaded from the on-disk pipeline cache had num_textures == 0 and tu5_emit_textures() returned early without programming TEX_CONST.  TPL1 then sampled a null descriptor: the output was zero (black vkcube) and every draw produced a translation fault at IOVA 0.  Serialize the four fields and bump the cache-format version so stale blobs are not deserialized.
+
+Signed-off-by: Kulesha Evgeniy <voovdop@gmail.com>
+---
+ src/freedreno/vulkan/tu_device.cc |  6 ++++++
+ src/freedreno/vulkan/tu_shader.cc | 11 +++++++++++
+ 2 files changed, 17 insertions(+)
+
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index 70c0bbd..1edffac 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -119,6 +119,12 @@ tu_device_get_cache_uuid(struct tu_physical_device *device, void *uuid)
+    if (!tu_device_get_build_id(&ctx))
+       return -1;
+ 
++   /* Bump this whenever the VkPipelineCache/tu_shader blob format changes, so
++    * stale on-disk entries from an older build are not deserialized.
++    */
++   const uint32_t cache_format_version = 1;
++   _mesa_blake3_update(&ctx, &cache_format_version, sizeof(cache_format_version));
++
+    _mesa_blake3_update(&ctx, &chip_id, sizeof(chip_id));
+    _mesa_blake3_update(&ctx, &device->uche_trap_base, sizeof(device->uche_trap_base));
+    _mesa_blake3_update(&ctx, &device->compiler_options,
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index 410ba5f..d84d999 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -3696,6 +3696,17 @@ tu_shader_cache_process_blob(IO &io, struct tu_shader *shader)
+    io.bytes(shader->ubo_map, sizeof(shader->ubo_map));
+    io.boolean(shader->per_layer_viewport);
+ 
++   /* a5xx has bindful TPL1 state: the draw-time texture/sampler setup reads
++    * these tables.  They must be part of the pipeline-cache blob, otherwise a
++    * warm-cache shader has num_textures == 0 and the driver skips programming
++    * TEX_CONST entirely, so the GPU samples a null descriptor (black output
++    * plus translation faults at IOVA 0).
++    */
++   io.u8(shader->num_textures);
++   io.bytes(shader->tex_map, sizeof(shader->tex_map));
++   io.u8(shader->num_samplers);
++   io.bytes(shader->samp_map, sizeof(shader->samp_map));
++
+    io.variant(shader->variant);
+ 
+    uint8_t has_safe_const;

@@ -1,0 +1,31 @@
+From 43823af6871ce18923a69aa4af2487450a0ce01f Mon Sep 17 00:00:00 2001
+From: Kulesha Evgeniy <voovdop@gmail.com>
+Date: Sun, 22 Nov 2026 15:12:14 +0200
+Subject: [PATCH 9/9] turnip/a5xx: expose samplerAnisotropy for vkmark
+
+The a5xx compute-MVP feature set intentionally exposes only the
+features the bring-up path needs, but vkmark requests samplerAnisotropy
+unconditionally at device creation.  The hardware supports anisotropic
+filtering, so advertise it for chip 5 as well; this lets vkmark create a
+device and run its rendering benchmarks.
+
+Signed-off-by: Kulesha Evgeniy <voovdop@gmail.com>
+---
+ src/freedreno/vulkan/tu_device.cc | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index 1edffac..0883a04 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -457,6 +457,10 @@ tu_get_features(struct tu_physical_device *pdevice,
+        */
+       features->robustBufferAccess = true;
+       features->shaderInt64 = true;
++      /* vkmark requests this feature even when it does not sample
++       * anisotropically; the hardware supports it.
++       */
++      features->samplerAnisotropy = true;
+       return;
+    }
+ 

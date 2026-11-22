@@ -1,8 +1,24 @@
 # Turnip A5xx (Adreno 509): bring-up status
 
 Mesa fork: this repository (`mesa-A5xx`).
-Working tag: **`a5xx-vkcube-working`** (`af1f612`).
+Working tag: **`a5xx-vkcube-working`** (`a6e57fe`); master adds
+`51828ed`, `04fdfbf` and `43823af`.
 Target: Xiaomi Redmi Note 5 / whyred, Adreno 509 (a5xx, sysmem path).
+
+## Commits
+
+- `83f34df` — compute bring-up for Adreno 509;
+- `31237b7` — sysmem graphics bring-up;
+- `3490401` — bindful TPL1 textures;
+- `064541c` — WSI, CPU copies and indexed draws;
+- `ca8636a` — tests, docs, installer and KWin workarounds;
+- `51828ed` — keep texture samples f32;
+- `04fdfbf` — keep bindful tex/sampler tables in the pipeline cache blob;
+- `a6e57fe` — public installer and docs (tag `a5xx-vkcube-working`);
+- `43823af` — expose `samplerAnisotropy` for vkmark.
+
+The latest vkmark run passes shading/texture/effect2d/desktop/cube scenes,
+survives a two-minute stress run with no reset or fault at ~49–53 °C.
 
 ## What works
 

@@ -1,31 +1,44 @@
-From 09bd044b3ae18624fac42bb87866c5925d395a35 Mon Sep 17 00:00:00 2001
-From: local <local@local>
-Date: Thu, 19 Nov 2026 20:18:00 +0200
-Subject: [PATCH 01/29] turnip: add isolated a5xx compute MVP path
+From 83f34df696f72dea73b2900f1cef323c04fde1b8 Mon Sep 17 00:00:00 2001
+From: Kulesha Evgeniy <voovdop@gmail.com>
+Date: Sat, 21 Nov 2026 18:18:26 +0200
+Subject: [PATCH 1/9] turnip/a5xx: add compute bring-up for Adreno 509
 
-Do not wire a5xx into the A6XX+ template machinery: program the a5xx
-compute state with CP_LOAD_STATE4, HLSQ_CS_* and a shader object, upload
-SSBO state from a compact per-binding descriptor, and dispatch with
-CP_EXEC_CS. Lower Vulkan descriptor intrinsics to bindful SSBO slots for
-gen5 and restrict the exposed features to the compute MVP.
+Add the isolated compute path used on the Adreno 509: descriptor sets, SSBO/UBO loads, push constants, descriptor arrays, indirect dispatch and the userspace-VA/vm_bind fallback.  UCHE is invalidated before dispatches on this generation.
 
-Generated-by: LLM
+Signed-off-by: Kulesha Evgeniy <voovdop@gmail.com>
 ---
+ src/freedreno/ir3/ir3_shader.h            |   4 +-
  src/freedreno/vulkan/meson.build          |   1 +
- src/freedreno/vulkan/tu5_compute.cc       | 316 ++++++++++++++++++++++
- src/freedreno/vulkan/tu5_compute.h        |  33 +++
- src/freedreno/vulkan/tu5_regs.h           | 108 ++++++++
- src/freedreno/vulkan/tu_cmd_buffer.cc     |  32 +--
- src/freedreno/vulkan/tu_cmd_buffer.h      |  22 ++
- src/freedreno/vulkan/tu_descriptor_set.cc |  16 ++
- src/freedreno/vulkan/tu_device.cc         |  34 ++-
- src/freedreno/vulkan/tu_shader.cc         |  99 +++++--
- src/freedreno/vulkan/tu_shader.h          |  11 +
- 10 files changed, 632 insertions(+), 40 deletions(-)
+ src/freedreno/vulkan/tu5_compute.cc       | 463 ++++++++++++++++++++++
+ src/freedreno/vulkan/tu5_compute.h        |  33 ++
+ src/freedreno/vulkan/tu5_regs.h           | 108 +++++
+ src/freedreno/vulkan/tu_cmd_buffer.cc     |  36 +-
+ src/freedreno/vulkan/tu_cmd_buffer.h      |  22 +
+ src/freedreno/vulkan/tu_descriptor_set.cc |  16 +
+ src/freedreno/vulkan/tu_device.cc         |  61 ++-
+ src/freedreno/vulkan/tu_knl_drm_msm.cc    |  11 +
+ src/freedreno/vulkan/tu_shader.cc         | 301 +++++++++++++-
+ src/freedreno/vulkan/tu_shader.h          |  16 +
+ 12 files changed, 1022 insertions(+), 50 deletions(-)
  create mode 100644 src/freedreno/vulkan/tu5_compute.cc
  create mode 100644 src/freedreno/vulkan/tu5_compute.h
  create mode 100644 src/freedreno/vulkan/tu5_regs.h
 
+diff --git a/src/freedreno/ir3/ir3_shader.h b/src/freedreno/ir3/ir3_shader.h
+index 87571bf..6cb824e 100644
+--- a/src/freedreno/ir3/ir3_shader.h
++++ b/src/freedreno/ir3/ir3_shader.h
+@@ -234,7 +234,9 @@ enum ir3_const_alloc_type {
+    IR3_CONST_ALLOC_PRIMITIVE_MAP = 11,
+    /* For SSBO emulation */
+    IR3_CONST_ALLOC_BINDLESS_BASE_ADDRS = 12,
+-   IR3_CONST_ALLOC_MAX = 13,
++   /* a5xx: per-slot SSBO sizes in bytes for get_ssbo_size() */
++   IR3_CONST_ALLOC_SSBO_SIZES = 13,
++   IR3_CONST_ALLOC_MAX = 14,
+ };
+ 
+ struct ir3_const_allocation {
 diff --git a/src/freedreno/vulkan/meson.build b/src/freedreno/vulkan/meson.build
 index b019710..f7afb79 100644
 --- a/src/freedreno/vulkan/meson.build
@@ -40,10 +53,10 @@ index b019710..f7afb79 100644
  libtu_files += custom_target(
 diff --git a/src/freedreno/vulkan/tu5_compute.cc b/src/freedreno/vulkan/tu5_compute.cc
 new file mode 100644
-index 0000000..9bb8f81
+index 0000000..b7c9f41
 --- /dev/null
 +++ b/src/freedreno/vulkan/tu5_compute.cc
-@@ -0,0 +1,316 @@
+@@ -0,0 +1,463 @@
 +/*
 + * Copyright © 2026 Mesa contributors
 + * SPDX-License-Identifier: MIT
@@ -57,11 +70,11 @@ index 0000000..9bb8f81
 + * checks so that A6XX+ behavior is unchanged.
 + *
 + * Current MVP limitations (deliberate, to be lifted step by step):
-+ *  - direct dispatch only (no CP_EXEC_CS_INDIRECT yet),
 + *  - storage buffers only, no UBOs/images/push constants,
 + *  - storage buffers must live in descriptor set 0; the hardware slot is the
 + *    Vulkan binding number (bindful isam/ldgb model of a5xx),
-+ *  - one descriptor per binding (no arrays).
++ *  - one descriptor per binding (no arrays),
++ *  - get_ssbo_size() currently returns 0 on a5xx.
 + */
 +
 +#include "tu5_compute.h"
@@ -252,10 +265,13 @@ index 0000000..9bb8f81
 +
 +   uint64_t addrs[TU5_MAX_SSBOS] = {};
 +   uint32_t sizes[TU5_MAX_SSBOS] = {};
++   unsigned max_binding = 0;
 +
 +   for (unsigned i = 0; i < shader->num_ssbos; i++) {
 +      unsigned set = shader->ssbo_map[i].set;
 +      unsigned binding = shader->ssbo_map[i].binding;
++
++      max_binding = MAX2(max_binding, binding);
 +      const struct tu_descriptor_set *dset =
 +         set < MAX_SETS ? ds->sets[set] : NULL;
 +
@@ -267,12 +283,17 @@ index 0000000..9bb8f81
 +      if (bl->type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
 +         continue;
 +
-+      const uint32_t *desc = dset->mapped_ptr + bl->offset / 4;
-+      addrs[i] = desc[0] | ((uint64_t)desc[1] << 32);
-+      sizes[i] = desc[2];
++      unsigned array_size = MAX2(bl->array_size, 1);
++      for (unsigned e = 0; e < array_size && binding + e < TU5_MAX_SSBOS; e++) {
++         const uint32_t *desc = dset->mapped_ptr + bl->offset / 4 +
++                                e * bl->size / 4;
++         addrs[binding + e] = desc[0] | ((uint64_t)desc[1] << 32);
++         sizes[binding + e] = desc[2];
++         max_binding = MAX2(max_binding, binding + e);
++      }
 +   }
 +
-+   unsigned count = shader->num_ssbos;
++   unsigned count = max_binding + 1;
 +
 +   /* Sizes live in the "constants" state type, addresses in the "UBO" state
 +    * type; both are two dwords per buffer, matching Gallium's a5xx emit_ssbos.
@@ -300,6 +321,138 @@ index 0000000..9bb8f81
 +   tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
 +   for (unsigned i = 0; i < count; i++)
 +      tu_cs_emit_qw(&cmd->cs, addrs[i]);
++   /* a5xx get_ssbo_size() is lowered to a const load: upload per-slot sizes
++    * (in bytes) into the reserved const range.
++    */
++   const struct ir3_shader_variant *v = shader->variant;
++   if (ir3_const_can_upload(&v->const_state->allocs,
++                            IR3_CONST_ALLOC_SSBO_SIZES, v->constlen)) {
++      uint32_t off =
++         v->const_state->allocs.consts[IR3_CONST_ALLOC_SSBO_SIZES].offset_vec4;
++      unsigned units = DIV_ROUND_UP(TU5_MAX_SSBOS, 4);
++
++      tu_cs_emit_pkt7(&cmd->cs, CP_LOAD_STATE4, 3 + units * 4);
++      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_0_DST_OFF(off) |
++                               CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
++                               CP_LOAD_STATE4_0_STATE_BLOCK(SB4_CS_SHADER) |
++                               CP_LOAD_STATE4_0_NUM_UNIT(units));
++      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
++                               CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
++      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
++      for (unsigned i = 0; i < units * 4; i++)
++         tu_cs_emit(&cmd->cs, i < TU5_MAX_SSBOS ? sizes[i] * 4 : 0);
++   }
++}
++
++static void
++tu5_emit_push_consts(struct tu_cmd_buffer *cmd,
++                     const struct ir3_shader_variant *v)
++{
++   const struct tu_shader *shader = cmd->state.shaders[MESA_SHADER_COMPUTE];
++   const struct tu_push_constant_range *pc = &shader->const_state.push_consts;
++
++   if (pc->type != IR3_PUSH_CONSTS_PER_STAGE || pc->dwords == 0)
++      return;
++
++   unsigned units = DIV_ROUND_UP(pc->dwords, 4);
++
++   tu_cs_emit_pkt7(&cmd->cs, CP_LOAD_STATE4, 3 + units * 4);
++   tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_0_DST_OFF(pc->lo_dwords / 4) |
++                            CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
++                            CP_LOAD_STATE4_0_STATE_BLOCK(SB4_CS_SHADER) |
++                            CP_LOAD_STATE4_0_NUM_UNIT(units));
++   tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
++                            CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
++   tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
++
++   for (unsigned i = 0; i < units * 4; i++)
++      tu_cs_emit(&cmd->cs,
++                 i < pc->dwords ? cmd->push_constants[i] : 0);
++}
++
++static uint64_t
++tu5_get_ubo_addr(struct tu_cmd_buffer *cmd, unsigned binding)
++{
++   struct tu_descriptor_state *ds =
++      tu_get_descriptors_state(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
++   struct tu_descriptor_set *dset = ds->sets[0];
++
++   if (!dset || binding >= dset->layout->binding_count || !dset->mapped_ptr)
++      return 0;
++
++   const struct tu_descriptor_set_binding_layout *bl =
++      &dset->layout->binding[binding];
++   if (bl->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
++      return 0;
++
++   const uint32_t *desc = dset->mapped_ptr + bl->offset / 4;
++   return desc[0] | ((uint64_t)(desc[1] & 0x1ffff) << 32);
++}
++
++static void
++tu5_emit_ubo_state(struct tu_cmd_buffer *cmd)
++{
++   struct tu_shader *shader = cmd->state.shaders[MESA_SHADER_COMPUTE];
++   const struct ir3_shader_variant *v = shader->variant;
++
++   if (!shader->num_ubos)
++      return;
++
++   const struct ir3_const_allocations *allocs = &v->const_state->allocs;
++
++   /* Full UBO loads go through pointers in const state (gen < 6). */
++   if (ir3_const_can_upload(allocs, IR3_CONST_ALLOC_UBO_PTRS, v->constlen)) {
++      uint32_t off = allocs->consts[IR3_CONST_ALLOC_UBO_PTRS].offset_vec4;
++      unsigned slots = MAX2((unsigned)shader->num_ubos, v->const_state->num_ubos);
++      unsigned units = DIV_ROUND_UP(slots * 2, 4);
++
++      tu_cs_emit_pkt7(&cmd->cs, CP_LOAD_STATE4, 3 + units * 4);
++      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_0_DST_OFF(off) |
++                               CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
++                               CP_LOAD_STATE4_0_STATE_BLOCK(SB4_CS_SHADER) |
++                               CP_LOAD_STATE4_0_NUM_UNIT(units));
++      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
++                               CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
++      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
++
++      for (unsigned i = 0; i < units * 4; i++) {
++         unsigned slot = i / 2;
++         unsigned addr_lo = 0, addr_hi = 0;
++         if (slot < shader->num_ubos) {
++            uint64_t addr = tu5_get_ubo_addr(cmd, shader->ubo_map[slot].binding);
++            addr_lo = addr;
++            addr_hi = addr >> 32;
++         }
++         tu_cs_emit(&cmd->cs, (i & 1) ? addr_hi : addr_lo);
++      }
++   }
++
++   /* Static subranges are pushed directly into const state. */
++   const struct ir3_ubo_analysis_state *state = &v->const_state->ubo_state;
++   for (unsigned i = 0; i < state->num_enabled; i++) {
++      const struct ir3_ubo_range *r = &state->range[i];
++      uint32_t size = r->end - r->start;
++      if (!size || !ir3_const_can_upload(allocs, IR3_CONST_ALLOC_UBO_RANGES,
++                                         v->constlen))
++         continue;
++
++      uint64_t addr = tu5_get_ubo_addr(cmd, r->ubo.block);
++      if (!addr)
++         continue;
++
++      unsigned units = size / 16;
++      if (!units)
++         continue;
++
++      tu_cs_emit_pkt7(&cmd->cs, CP_LOAD_STATE4, 3);
++      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_0_DST_OFF(r->offset / 16) |
++                               CP_LOAD_STATE4_0_STATE_SRC(SS4_INDIRECT) |
++                               CP_LOAD_STATE4_0_STATE_BLOCK(SB4_CS_SHADER) |
++                               CP_LOAD_STATE4_0_NUM_UNIT(units));
++      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
++                               CP_LOAD_STATE4_1_EXT_SRC_ADDR((uint32_t)(addr + r->start)));
++      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI((addr + r->start) >> 32));
++   }
 +}
 +
 +void
@@ -313,17 +466,14 @@ index 0000000..9bb8f81
 +   if (!shader)
 +      return;
 +
-+   /* Indirect dispatch needs CP_EXEC_CS_INDIRECT plus a properly sized
-+    * dispatch buffer; keep it out of the first MVP.
-+    */
-+   if (info->indirect)
-+      return;
-+
 +   const struct ir3_shader_variant *v = shader->variant;
 +
 +   tu5_emit_flush(cmd);
 +   tu5_emit_driver_params(cmd, v, info);
++   tu5_emit_push_consts(cmd, v);
 +   tu5_emit_ssbo_state(cmd);
++   tu5_emit_ubo_state(cmd);
++   tu5_emit_ubo_state(cmd);
 +
 +   const uint16_t *local_size = v->local_size;
 +   const uint32_t *num_groups = info->blocks;
@@ -349,11 +499,21 @@ index 0000000..9bb8f81
 +   tu_cs_emit(&cmd->cs, 1);
 +   tu_cs_emit(&cmd->cs, 1);
 +
-+   tu_cs_emit_pkt7(&cmd->cs, CP_EXEC_CS, 4);
-+   tu_cs_emit(&cmd->cs, 0);
-+   tu_cs_emit(&cmd->cs, CP_EXEC_CS_1_NGROUPS_X(num_groups[0]));
-+   tu_cs_emit(&cmd->cs, CP_EXEC_CS_2_NGROUPS_Y(num_groups[1]));
-+   tu_cs_emit(&cmd->cs, CP_EXEC_CS_3_NGROUPS_Z(num_groups[2]));
++   if (info->indirect) {
++      tu_cs_emit_pkt7(&cmd->cs, CP_EXEC_CS_INDIRECT, 4);
++      tu_cs_emit(&cmd->cs, 0);
++      tu_cs_emit_qw(&cmd->cs, info->indirect);
++      tu_cs_emit(&cmd->cs,
++         A5XX_CP_EXEC_CS_INDIRECT_3_LOCALSIZEX(local_size[0] - 1) |
++         A5XX_CP_EXEC_CS_INDIRECT_3_LOCALSIZEY(local_size[1] - 1) |
++         A5XX_CP_EXEC_CS_INDIRECT_3_LOCALSIZEZ(local_size[2] - 1));
++   } else {
++      tu_cs_emit_pkt7(&cmd->cs, CP_EXEC_CS, 4);
++      tu_cs_emit(&cmd->cs, 0);
++      tu_cs_emit(&cmd->cs, CP_EXEC_CS_1_NGROUPS_X(num_groups[0]));
++      tu_cs_emit(&cmd->cs, CP_EXEC_CS_2_NGROUPS_Y(num_groups[1]));
++      tu_cs_emit(&cmd->cs, CP_EXEC_CS_3_NGROUPS_Z(num_groups[2]));
++   }
 +
 +   /* Make the CS writes visible before the host reads the result. */
 +   tu5_emit_flush(cmd);
@@ -514,7 +674,7 @@ index 0000000..db45758
 +
 +#endif /* TU5_REGS_H */
 diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
-index e9c7454..c6c8d41 100644
+index e9c7454..612b890 100644
 --- a/src/freedreno/vulkan/tu_cmd_buffer.cc
 +++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
 @@ -17,6 +17,7 @@
@@ -525,7 +685,18 @@ index e9c7454..c6c8d41 100644
  #include "tu_autotune.h"
  #include "tu_buffer.h"
  #include "tu_clear_blit.h"
-@@ -4530,6 +4531,9 @@ tu_BeginCommandBuffer(VkCommandBuffer commandBuffer,
+@@ -2406,6 +2407,10 @@ tu_emit_bin_preamble(struct tu_device *dev, struct tu_cs *cs, bool bv)
+ VkResult
+ tu_init_bin_preamble(struct tu_device *device)
+ {
++   /* a5xx compute MVP: there is no binning preamble. */
++   if (device->physical_device->info->chip == 5)
++      return VK_SUCCESS;
++
+    struct tu_cs preamble_cs;
+    VkResult result = tu_cs_begin_sub_stream(&device->sub_cs, 256, &preamble_cs);
+    if (result != VK_SUCCESS)
+@@ -4530,6 +4535,9 @@ tu_BeginCommandBuffer(VkCommandBuffer commandBuffer,
     if (cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
        switch (cmd_buffer->queue_family_index) {
        case TU_QUEUE_GENERAL:
@@ -535,7 +706,7 @@ index e9c7454..c6c8d41 100644
           TU_CALLX(cmd_buffer->device, tu_init_hw)(cmd_buffer, &cmd_buffer->cs);
           result = tu_cs_get_status(&cmd_buffer->cs);
           if (result != VK_SUCCESS)
-@@ -9844,29 +9848,6 @@ tu_install_sw_multiview_draw_entrypoints(
+@@ -9844,29 +9852,6 @@ tu_install_sw_multiview_draw_entrypoints(
     FD_CALLX(info, tu_install_sw_multiview_draws)(dispatch_table);
  }
  
@@ -565,7 +736,7 @@ index e9c7454..c6c8d41 100644
  static inline struct ir3_driver_params_cs
  build_driver_params_cs(const struct ir3_shader_variant *variant,
                         const struct tu_dispatch_info *info)
-@@ -10079,6 +10060,11 @@ static void
+@@ -10079,6 +10064,11 @@ static void
  tu_dispatch(struct tu_cmd_buffer *cmd,
              const struct tu_dispatch_info *info)
  {
@@ -638,7 +809,7 @@ index 8843f7b..fe34ab8 100644
      * 16-bit and 32-bit access through isam.v will of course only be functional
      * when 16-bit storage is supported. */
 diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
-index 0d3e63e..273828a 100644
+index 0d3e63e..97fa4c0 100644
 --- a/src/freedreno/vulkan/tu_device.cc
 +++ b/src/freedreno/vulkan/tu_device.cc
 @@ -445,6 +445,15 @@ tu_get_features(struct tu_physical_device *pdevice,
@@ -679,7 +850,31 @@ index 0d3e63e..273828a 100644
     case 6:
     case 7:
     case 8: {
-@@ -2885,6 +2909,13 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
+@@ -2334,6 +2358,23 @@ tu_trace_record_ts(struct u_trace *ut, void *cs, void *timestamps,
+    return true;
+ }
+ 
++/* a5xx trace timestamps: the same CP_EVENT_WRITE form as A6XX. */
++static bool
++tu_trace_record_ts_a5xx(struct u_trace *ut, void *cs, void *timestamps,
++                        uint64_t offset_B, uint32_t flags)
++{
++   struct tu_suballoc_bo *bo = static_cast<struct tu_suballoc_bo *>(timestamps);
++   struct tu_cs *ts_cs = static_cast<struct tu_cs *>(cs);
++
++   tu_cs_emit_pkt7(ts_cs, CP_EVENT_WRITE, 4);
++   tu_cs_emit(ts_cs, CP_EVENT_WRITE_0_EVENT(RB_DONE_TS) |
++                        CP_EVENT_WRITE_0_TIMESTAMP);
++   tu_cs_emit_qw(ts_cs, bo->iova + offset_B);
++   tu_cs_emit(ts_cs, 0x00000000);
++
++   return true;
++}
++
+ static uint64_t
+ tu_trace_read_ts(struct u_trace_context *utctx,
+                  void *timestamps, uint64_t offset_B,
+@@ -2885,6 +2926,13 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
        &dispatch_table, &tu_device_entrypoints, override_initial_entrypoints);
  
     switch (fd_dev_gen(&physical_device->dev_id)) {
@@ -693,7 +888,7 @@ index 0d3e63e..273828a 100644
     case 6:
        vk_device_dispatch_table_from_entrypoints(
           &dispatch_table, &tu_device_entrypoints_a6xx, false);
-@@ -2904,7 +2935,8 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
+@@ -2904,7 +2952,8 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
     /* Devices without HW multiview emulate it by replaying each draw once per
      * view, which is done by wrapping the draw entrypoints.
      */
@@ -703,8 +898,60 @@ index 0d3e63e..273828a 100644
        tu_install_sw_multiview_draw_entrypoints(&dispatch_table,
                                                 physical_device->info);
     }
+@@ -3035,14 +3084,16 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
+       goto fail_queues;
+ 
+    {
++      const bool is_a5xx = physical_device->info->chip == 5;
++
+       struct ir3_compiler_options ir3_options = {
+-         .push_ubo_with_preamble = true,
++         .push_ubo_with_preamble = !is_a5xx,
+          .disable_cache = true,
+          .bindless_fb_read_descriptor = -1,
+          .bindless_fb_read_slot = -1,
+          .storage_16bit = physical_device->info->props.storage_16bit,
+          .storage_8bit = physical_device->info->props.storage_8bit,
+-         .shared_push_consts = !TU_DEBUG(PUSH_CONSTS_PER_STAGE),
++         .shared_push_consts = !is_a5xx && !TU_DEBUG(PUSH_CONSTS_PER_STAGE),
+          .uche_trap_base = physical_device->uche_trap_base,
+          .lower_draw_id = physical_device->info->chip >= A8XX,
+       };
+@@ -3279,7 +3330,9 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
+                      12,
+                      tu_trace_create_buffer,
+                      tu_trace_destroy_buffer,
+-                     TU_CALLX(device, tu_trace_record_ts),
++                     physical_device->info->chip == 5 ?
++                        tu_trace_record_ts_a5xx :
++                        TU_CALLX(device, tu_trace_record_ts),
+                      tu_trace_read_ts,
+                      tu_trace_capture_data,
+                      tu_trace_get_data,
+diff --git a/src/freedreno/vulkan/tu_knl_drm_msm.cc b/src/freedreno/vulkan/tu_knl_drm_msm.cc
+index fe0ec29..ea6d3ae 100644
+--- a/src/freedreno/vulkan/tu_knl_drm_msm.cc
++++ b/src/freedreno/vulkan/tu_knl_drm_msm.cc
+@@ -1399,6 +1399,17 @@ tu_knl_drm_msm_load(struct tu_instance *instance,
+    device->gmem_base = val;
+ 
+    device->has_set_iova = !msm_common_get_va_prop(device->local_fd, MSM_PIPE_3D0, &device->va_start, &device->va_size);
++   /* Some older kernels report VA props but with a zero/too-small range. */
++   if (device->has_set_iova && device->va_size < 0x100000) {
++      device->has_set_iova = false;
++      device->va_start = 0;
++      device->va_size = 0;
++   }
++   /* vm_bind without a userspace VA range still needs a VMA heap in Turnip. */
++   if (!device->has_set_iova) {
++      device->has_vm_bind = false;
++      device->has_sparse = false;
++   }
+    device->has_iova_align = device->has_set_iova;
+    device->has_lazy_bos = device->has_set_iova;
+    device->has_raytracing = tu_drm_get_param_or(fd, MSM_PARAM_RAYTRACING, &val, false);
 diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
-index bc5bf6e..507606f 100644
+index bc5bf6e..89eb7c4 100644
 --- a/src/freedreno/vulkan/tu_shader.cc
 +++ b/src/freedreno/vulkan/tu_shader.cc
 @@ -19,6 +19,7 @@
@@ -715,52 +962,214 @@ index bc5bf6e..507606f 100644
  #include "tu_descriptor_set.h"
  #include "tu_device.h"
  #include "tu_lrz.h"
-@@ -344,6 +345,16 @@ lower_vulkan_resource_index(struct tu_device *dev, nir_builder *b,
+@@ -205,10 +206,12 @@ tu_spirv_to_nir(struct tu_device *dev,
+    const nir_shader_compiler_options *nir_options =
+       ir3_get_compiler_options(dev->compiler);
+ 
++   spirv_to_nir_options spirv_options = tu_spirv_options;
++
+    nir_shader *nir;
+    VkResult result =
+       vk_pipeline_shader_stage_to_nir(&dev->vk, pipeline_flags, stage_info,
+-                                      &tu_spirv_options, nir_options,
++                                      &spirv_options, nir_options,
+                                       mem_ctx, &nir);
+    if (result != VK_SUCCESS)
+       return NULL;
+@@ -226,8 +229,19 @@ tu_spirv_to_nir(struct tu_device *dev,
+     * UBOs/SSBOs, but spirv_to_nir sets them to the total number of objects
+     * which is useless for us, so reset them here.
+     */
+-   nir->info.num_ubos = 0;
+-   nir->info.num_ssbos = 0;
++   if (dev->physical_device->info->chip == 5) {
++      uint32_t max_ssbo = 0;
++      nir_foreach_variable_with_modes (var, nir, nir_var_mem_ssbo)
++         max_ssbo = MAX2(max_ssbo, var->data.binding + 1);
++      uint32_t max_ubo = 0;
++      nir_foreach_variable_with_modes (var, nir, nir_var_mem_ubo)
++         max_ubo = MAX2(max_ubo, var->data.binding + 1);
++      nir->info.num_ubos = MAX2(max_ubo, (uint32_t)TU5_MAX_UBOS);
++      nir->info.num_ssbos = MAX2(max_ssbo, (uint32_t)TU5_MAX_SSBOS);
++   } else {
++      nir->info.num_ubos = 0;
++      nir->info.num_ssbos = 0;
++   }
+ 
+    if (dev->physical_device->compiler_options.compute_round_robin) {
+       nir->info.occupancy_bounded_workgroup_fairness = true;
+@@ -344,6 +358,17 @@ lower_vulkan_resource_index(struct tu_device *dev, nir_builder *b,
  
     unsigned set = nir_intrinsic_desc_set(instr);
     unsigned binding = nir_intrinsic_binding(instr);
 +
 +   if (dev->physical_device->info->chip == 5) {
-+      /* a5xx has no bindless descriptor memory. isam/ldgb take an immediate
-+       * SSBO state slot, so lower the descriptor to the binding number and
-+       * require set 0 (checked when the shader is created).
++      /* a5xx bindful descriptors: keep the bindless vec3 shape but encode the
++       * hardware SSBO slot (== Vulkan binding) in the first component.
 +       */
-+      nir_def_replace(&instr->def, nir_imm_int(b, binding));
++      nir_def_replace(&instr->def,
++                      nir_vec3(b, nir_imm_int(b, binding),
++                               nir_imm_int(b, 0), nir_imm_int(b, 0)));
 +      return;
 +   }
 +
     struct tu_descriptor_set_layout *set_layout = layout->set[set].layout;
     struct tu_descriptor_set_binding_layout *binding_layout =
        &set_layout->binding[binding];
-@@ -420,8 +431,17 @@ lower_vulkan_resource_reindex(nir_builder *b, nir_intrinsic_instr *instr)
+@@ -790,6 +815,8 @@ lower_intrinsic(nir_builder *b, nir_intrinsic_instr *instr,
+    case nir_intrinsic_ssbo_atomic:
+    case nir_intrinsic_ssbo_atomic_swap:
+    case nir_intrinsic_get_ssbo_size:
++      if (dev->physical_device->info->chip == 5)
++         return false;
+       return lower_ssbo_ubo_intrinsic(dev, b, instr);
+ 
+    case nir_intrinsic_image_deref_load:
+@@ -1505,6 +1532,131 @@ shader_uses_push_consts(nir_shader *shader)
+    return false;
  }
  
- static void
--lower_load_vulkan_descriptor(nir_builder *b, nir_intrinsic_instr *intrin)
-+lower_load_vulkan_descriptor(nir_builder *b, nir_intrinsic_instr *intrin,
-+                             struct tu_device *dev)
- {
-+   if (dev->physical_device->info->chip == 5) {
-+      /* a5xx bindful path: vulkan_resource_index already produced the
-+       * scalar SSBO slot and the descriptor load is a no-op.
-+       */
-+      nir_def_replace(&intrin->def, intrin->src[0].ssa);
-+      return;
++static bool
++tu5_trace_desc_binding(nir_def *def, unsigned *slot)
++{
++   nir_instr *instr = nir_def_instr(def);
++
++   switch (instr->type) {
++   case nir_instr_type_intrinsic: {
++      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++      switch (intr->intrinsic) {
++      case nir_intrinsic_load_vulkan_descriptor:
++         return tu5_trace_desc_binding(intr->src[0].ssa, slot);
++      case nir_intrinsic_vulkan_resource_index: {
++         if (!nir_src_is_const(intr->src[0]))
++            return false;
++         *slot = nir_intrinsic_binding(intr) + nir_src_as_uint(intr->src[0]);
++         return true;
++      }
++      case nir_intrinsic_vulkan_resource_reindex: {
++         unsigned base;
++         if (!tu5_trace_desc_binding(intr->src[0].ssa, &base) ||
++             !nir_src_is_const(intr->src[1]))
++            return false;
++         *slot = base + nir_src_as_uint(intr->src[1]);
++         return true;
++      }
++      default:
++         return false;
++      }
++   }
++   case nir_instr_type_alu: {
++      nir_alu_instr *alu = nir_instr_as_alu(instr);
++      for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
++         if (tu5_trace_desc_binding(alu->src[i].src.ssa, slot))
++            return true;
++      }
++      return false;
++   }
++   default:
++      return false;
++   }
++}
++
++static bool
++tu5_lower_bindful_ssbo_instr(nir_builder *b, nir_instr *instr, void *data)
++{
++   if (instr->type != nir_instr_type_intrinsic)
++      return false;
++
++   nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
++   unsigned desc_src;
++
++   switch (intrin->intrinsic) {
++   case nir_intrinsic_load_ubo:
++   case nir_intrinsic_load_ssbo:
++   case nir_intrinsic_ssbo_atomic:
++   case nir_intrinsic_ssbo_atomic_swap:
++   case nir_intrinsic_get_ssbo_size:
++      desc_src = 0;
++      break;
++   case nir_intrinsic_store_ssbo:
++      desc_src = 1;
++      break;
++   default:
++      return false;
 +   }
 +
-    nir_def *old_index = intrin->src[0].ssa;
-    /* Loading the descriptor happens as part of the load/store instruction so
-     * this is a no-op. We just need to turn the shift into an offset of 0.
-@@ -773,7 +793,7 @@ lower_intrinsic(nir_builder *b, nir_intrinsic_instr *instr,
-       return true;
++   if (intrin->src[desc_src].ssa->num_components == 1)
++      return false;
++
++   unsigned binding;
++   if (!tu5_trace_desc_binding(intrin->src[desc_src].ssa, &binding))
++      return false;
++
++   nir_builder b_at = nir_builder_at(nir_before_instr(instr));
++   nir_src_rewrite(&intrin->src[desc_src], nir_imm_int(&b_at, binding));
++   return true;
++}
++
++static bool
++tu5_lower_ssbo_size_instr(nir_builder *b, nir_instr *instr, void *data)
++{
++   if (instr->type != nir_instr_type_intrinsic)
++      return false;
++
++   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++   if (intr->intrinsic != nir_intrinsic_get_ssbo_size)
++      return false;
++
++   unsigned binding = 0;
++   if (nir_src_is_const(intr->src[0]))
++      binding = nir_src_as_uint(intr->src[0]);
++   if (binding >= TU5_MAX_SSBOS)
++      return false;
++
++   uint32_t base = *(const uint32_t *)data + binding;
++   nir_builder b_at = nir_builder_at(nir_before_instr(instr));
++   nir_def *size = nir_load_const_ir3(&b_at, 1, 32,
++                                      nir_imm_int(&b_at, 0), .base = base);
++   nir_def_replace(&intr->def, size);
++   return true;
++}
++
++static bool
++tu5_lower_ubo_global(nir_builder *b, nir_instr *instr, void *data)
++{
++   if (instr->type != nir_instr_type_intrinsic)
++      return false;
++   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++   if (intr->intrinsic != nir_intrinsic_load_ubo ||
++       !nir_src_is_const(intr->src[0]))
++      return false;
++
++   unsigned binding = nir_src_as_uint(intr->src[0]);
++   uint32_t base = *(const uint32_t *)data + binding * 2;
++   nir_builder b_at = nir_builder_at(nir_before_instr(instr));
++   nir_def *lo = nir_load_const_ir3(&b_at, 1, 32, nir_imm_int(&b_at, 0), .base = base);
++   nir_def *hi = nir_load_const_ir3(&b_at, 1, 32, nir_imm_int(&b_at, 0), .base = base + 1);
++   nir_def *ptr = nir_pack_64_2x32(&b_at, nir_vec2(&b_at, lo, hi));
++   nir_def *addr = nir_iadd(&b_at, ptr, nir_u2u64(&b_at, intr->src[1].ssa));
++   nir_def *val = nir_load_global(&b_at, intr->num_components,
++                                  intr->def.bit_size, addr);
++   nir_def_replace(&intr->def, val);
++   return true;
++}
++
+ static bool
+ tu_lower_io(nir_shader *shader, struct tu_device *dev,
+             struct tu_shader *tu_shader,
+@@ -1565,6 +1717,11 @@ tu_lower_io(nir_shader *shader, struct tu_device *dev,
+                       push_consts_vec4, offset_align_vec4);
+    }
  
-    case nir_intrinsic_load_vulkan_descriptor:
--      lower_load_vulkan_descriptor(b, instr);
-+      lower_load_vulkan_descriptor(b, instr, dev);
-       return true;
- 
-    case nir_intrinsic_vulkan_resource_index:
-@@ -3224,6 +3244,27 @@ tu_upload_variant(struct tu_cs *cs,
++   if (dev->physical_device->info->chip == 5) {
++      ir3_const_alloc(const_allocs, IR3_CONST_ALLOC_SSBO_SIZES,
++                      DIV_ROUND_UP(TU5_MAX_SSBOS, 4), 1);
++   }
++
+    bool unknown_dynamic_size = false;
+    bool unknown_dynamic_offset = false;
+    for (unsigned i = 0; i < layout->num_sets; i++) {
+@@ -3224,6 +3381,27 @@ tu_upload_variant(struct tu_cs *cs,
     return memory.iova;
  }
  
@@ -788,7 +1197,7 @@ index bc5bf6e..507606f 100644
  static VkResult
  tu_upload_shader(struct tu_device *dev,
                   struct tu_shader *shader)
-@@ -3323,26 +3364,23 @@ tu_upload_shader(struct tu_device *dev,
+@@ -3323,26 +3501,23 @@ tu_upload_shader(struct tu_device *dev,
        dev->physical_device->info->props.has_hw_multiview
           ? shader->view_mask : 0;
  
@@ -821,7 +1230,7 @@ index bc5bf6e..507606f 100644
        /* emit an empty VPC */
        TU_CALLX(dev, tu6_emit_vpc)(&sub_cs, binning, NULL, NULL, NULL, NULL);
        shader->binning_state = tu_cs_end_draw_state(&shader->cs, &sub_cs);
-@@ -3351,9 +3389,9 @@ tu_upload_shader(struct tu_device *dev,
+@@ -3351,9 +3526,9 @@ tu_upload_shader(struct tu_device *dev,
     if (safe_const_binning) {
        tu_cs_begin_sub_stream(&shader->cs, xs_size + vpc_size +
           tu_xs_get_additional_cs_size_dwords(safe_const_binning), &sub_cs);
@@ -834,18 +1243,20 @@ index bc5bf6e..507606f 100644
        /* emit an empty VPC */
        TU_CALLX(dev, tu6_emit_vpc)(&sub_cs, safe_const_binning, NULL, NULL, NULL, NULL);
        shader->safe_const_binning_state = tu_cs_end_draw_state(&shader->cs, &sub_cs);
-@@ -3441,6 +3479,8 @@ tu_shader_cache_process_blob(IO &io, struct tu_shader *shader)
+@@ -3441,6 +3616,10 @@ tu_shader_cache_process_blob(IO &io, struct tu_shader *shader)
     io.bytes(shader->dynamic_descriptor_sizes, sizeof(shader->dynamic_descriptor_sizes));
     io.u32(shader->view_mask);
     io.u8(shader->active_desc_sets);
 +   io.u8(shader->num_ssbos);
 +   io.bytes(shader->ssbo_map, sizeof(shader->ssbo_map));
++   io.u8(shader->num_ubos);
++   io.bytes(shader->ubo_map, sizeof(shader->ubo_map));
     io.boolean(shader->per_layer_viewport);
  
     io.variant(shader->variant);
-@@ -3723,15 +3763,42 @@ tu_shader_create(struct tu_device *dev,
- 
-    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+@@ -3716,11 +3895,79 @@ tu_shader_create(struct tu_device *dev,
+       }
+    }
  
 +   if (dev->physical_device->info->chip == 5) {
 +      /* Record the bindful SSBO map used by tu5_dispatch(). a5xx isam/ldgb
@@ -857,6 +1268,7 @@ index bc5bf6e..507606f 100644
 +
 +      nir_foreach_variable_with_modes (var, nir, nir_var_mem_ssbo) {
 +         if (var->data.descriptor_set != 0 ||
++             var->data.binding >= TU5_MAX_SSBOS ||
 +             shader->num_ssbos >= TU5_MAX_SSBOS) {
 +            vk_free(&dev->vk.alloc, shader);
 +            return VK_ERROR_FEATURE_NOT_PRESENT;
@@ -870,12 +1282,59 @@ index bc5bf6e..507606f 100644
 +      }
 +
 +      if (has_ssbo)
-+         nir->info.num_ssbos = max_binding + 1;
++         nir->info.num_ssbos = TU5_MAX_SSBOS;
 +   }
 +
-    struct ir3_shader_nir_options nir_options;
-    init_ir3_nir_options(&nir_options, key);
++   if (dev->physical_device->info->chip == 5) {
++      nir_foreach_variable_with_modes (var, nir, nir_var_mem_ubo) {
++         if (var->data.descriptor_set != 0 ||
++             var->data.binding >= TU5_MAX_UBOS) {
++            vk_free(&dev->vk.alloc, shader);
++            return VK_ERROR_FEATURE_NOT_PRESENT;
++         }
++         while (shader->num_ubos <= var->data.binding) {
++            shader->ubo_map[shader->num_ubos].set = 0;
++            shader->ubo_map[shader->num_ubos].binding = 0;
++            shader->num_ubos++;
++         }
++         shader->ubo_map[var->data.binding].set = var->data.descriptor_set;
++         shader->ubo_map[var->data.binding].binding = var->data.binding;
++      }
++   }
++
++   if (dev->physical_device->info->chip == 5) {
++      /* a5xx isam/ldgb take an immediate SSBO state slot; replace the bindless
++       * descriptor vector with that slot before descriptor lowering runs.
++       */
++      NIR_PASS(_, nir, nir_shader_instructions_pass,
++               tu5_lower_bindful_ssbo_instr, nir_metadata_none, NULL);
++   }
++
+    struct ir3_const_allocations const_allocs = {};
+    NIR_PASS(_, nir, tu_lower_io, dev, shader, ir3_key, layout,
+             key->read_only_input_attachments, key->dynamic_renderpass,
+             &const_allocs);
  
++   if (dev->physical_device->info->chip == 5) {
++      uint32_t size_base =
++         const_allocs.consts[IR3_CONST_ALLOC_SSBO_SIZES].offset_vec4 * 4;
++      NIR_PASS(_, nir, nir_shader_instructions_pass,
++               tu5_lower_ssbo_size_instr, nir_metadata_none, &size_base);
++   }
++
++   if (dev->physical_device->info->chip == 5 && shader->num_ubos) {
++      uint32_t ptrs_vec4 = DIV_ROUND_UP(shader->num_ubos * 2, 4);
++      ir3_const_alloc(&const_allocs, IR3_CONST_ALLOC_UBO_PTRS, ptrs_vec4, 1);
++      uint32_t base = const_allocs.consts[IR3_CONST_ALLOC_UBO_PTRS].offset_vec4 * 4;
++      NIR_PASS(_, nir, nir_shader_instructions_pass,
++               tu5_lower_ubo_global, nir_metadata_none, &base);
++      nir->info.num_ubos = 0;
++   }
++
+    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+ 
+    struct ir3_shader_nir_options nir_options;
+@@ -3729,9 +3976,10 @@ tu_shader_create(struct tu_device *dev,
     ir3_finalize_nir(dev->compiler, &nir_options, nir);
  
     /* This has to happen after finalizing, so that we know the final bitsize
@@ -888,11 +1347,44 @@ index bc5bf6e..507606f 100644
  
     if (dev->physical_device->compiler_options.enable_ssbo_emulation) {
        nir_lower_ssbo_options options = {
+@@ -4215,6 +4463,10 @@ tu_init_empty_shaders(struct tu_device *dev)
+ {
+    VkResult result;
+ 
++   /* a5xx compute MVP: no graphics stages, so no empty TCS/TES/GS/FS. */
++   if (dev->physical_device->info->chip == 5)
++      return VK_SUCCESS;
++
+    result = tu_empty_shader_create(dev, &dev->empty_tcs, MESA_SHADER_TESS_CTRL);
+    if (result != VK_SUCCESS)
+       goto out;
+@@ -4254,11 +4506,16 @@ out:
+ void
+ tu_destroy_empty_shaders(struct tu_device *dev)
+ {
+-   vk_pipeline_cache_object_unref(&dev->vk, &dev->empty_tcs->base);
+-   vk_pipeline_cache_object_unref(&dev->vk, &dev->empty_tes->base);
+-   vk_pipeline_cache_object_unref(&dev->vk, &dev->empty_gs->base);
+-   vk_pipeline_cache_object_unref(&dev->vk, &dev->empty_fs->base);
+-   vk_pipeline_cache_object_unref(&dev->vk, &dev->empty_fs_fdm->base);
++   if (dev->empty_tcs)
++      vk_pipeline_cache_object_unref(&dev->vk, &dev->empty_tcs->base);
++   if (dev->empty_tes)
++      vk_pipeline_cache_object_unref(&dev->vk, &dev->empty_tes->base);
++   if (dev->empty_gs)
++      vk_pipeline_cache_object_unref(&dev->vk, &dev->empty_gs->base);
++   if (dev->empty_fs)
++      vk_pipeline_cache_object_unref(&dev->vk, &dev->empty_fs->base);
++   if (dev->empty_fs_fdm)
++      vk_pipeline_cache_object_unref(&dev->vk, &dev->empty_fs_fdm->base);
+ }
+ 
+ void
 diff --git a/src/freedreno/vulkan/tu_shader.h b/src/freedreno/vulkan/tu_shader.h
-index e729d44..2f815ce 100644
+index e729d44..9b6552f 100644
 --- a/src/freedreno/vulkan/tu_shader.h
 +++ b/src/freedreno/vulkan/tu_shader.h
-@@ -59,6 +59,11 @@ struct tu_const_state
+@@ -59,6 +59,12 @@ struct tu_const_state
     struct ir3_driver_ubo bindless_base_addrs_ubo;
  };
  
@@ -900,19 +1392,24 @@ index e729d44..2f815ce 100644
 + * number, so only set 0 is supported by the current MVP.
 + */
 +#define TU5_MAX_SSBOS 8
++#define TU5_MAX_UBOS 8
 +
  struct tu_shader
  {
     struct vk_pipeline_cache_object base;
-@@ -79,6 +84,12 @@ struct tu_shader
+@@ -79,6 +85,16 @@ struct tu_shader
     uint32_t view_mask;
     uint8_t active_desc_sets;
  
-+   /* a5xx only: bindful SSBO slots recorded at shader creation. */
++   /* a5xx only: bindful SSBO/UBO slots recorded at shader creation. */
 +   uint8_t num_ssbos;
 +   struct {
 +      uint8_t set, binding;
 +   } ssbo_map[TU5_MAX_SSBOS];
++   uint8_t num_ubos;
++   struct {
++      uint8_t set, binding;
++   } ubo_map[TU5_MAX_UBOS];
 +
     /* The dynamic buffer descriptor size for descriptor sets that we know
      * about. This is used when linking to piece together the sizes and from

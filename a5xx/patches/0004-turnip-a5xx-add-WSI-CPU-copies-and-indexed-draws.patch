@@ -1,0 +1,1208 @@
+From 064541ca32d2cfc4bf712f97af2d56397f57f8b8 Mon Sep 17 00:00:00 2001
+From: Kulesha Evgeniy <voovdop@gmail.com>
+Date: Sat, 21 Nov 2026 18:18:26 +0200
+Subject: [PATCH 4/9] turnip/a5xx: add WSI, CPU copies and indexed draws
+
+Add the a5xx WSI path, CPU fallbacks for buffer/image copies and clears, UCHE cache maintenance on map/unmap, linear-only DRM modifiers, graphics UBO pointer upload, vkCmdBindIndexBuffer and CPU expansion of indexed draws.
+
+Signed-off-by: Kulesha Evgeniy <voovdop@gmail.com>
+---
+ src/freedreno/vulkan/tu5_graphics.cc  | 319 +++++++++++++++++++-
+ src/freedreno/vulkan/tu5_graphics.h   |   1 +
+ src/freedreno/vulkan/tu_clear_blit.cc | 408 +++++++++++++++++++++++++-
+ src/freedreno/vulkan/tu_cmd_buffer.cc |  28 +-
+ src/freedreno/vulkan/tu_cmd_buffer.h  |   4 +
+ src/freedreno/vulkan/tu_device.cc     |  19 +-
+ src/freedreno/vulkan/tu_image.cc      |   6 +-
+ src/freedreno/vulkan/tu_pass.cc       |   6 +
+ src/freedreno/vulkan/tu_wsi.cc        |   6 +-
+ 9 files changed, 775 insertions(+), 22 deletions(-)
+
+diff --git a/src/freedreno/vulkan/tu5_graphics.cc b/src/freedreno/vulkan/tu5_graphics.cc
+index 5809737..3536930 100644
+--- a/src/freedreno/vulkan/tu5_graphics.cc
++++ b/src/freedreno/vulkan/tu5_graphics.cc
+@@ -18,7 +18,9 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
++#include "tu_buffer.h"
+ #include "tu_cmd_buffer.h"
++#include "tu_knl.h"
+ #include "tu_image.h"
+ #include "tu_sampler.h"
+ #include "tu_shader.h"
+@@ -124,6 +126,8 @@ tu5_format(VkFormat format, bool *srgb, bool *sint, bool *uint_format)
+       return A5EN_RB5_R32_SINT;
+    case VK_FORMAT_R32_SFLOAT:
+       return A5EN_RB5_R32_FLOAT;
++   case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
++      return A5EN_RB5_R10G10B10A2_UNORM;
+    default:
+       return 0;
+    }
+@@ -135,6 +139,7 @@ tu5_format_swap(VkFormat format)
+    switch (format) {
+    case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_B8G8R8A8_SRGB:
++   case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
+       return WXYZ;
+    default:
+       return WZYX;
+@@ -645,6 +650,10 @@ tu5_emit_vs_driver_params(struct tu_cmd_buffer *cmd,
+    if (!size)
+       return;
+ 
++   if (getenv("TU5_GFX_DEBUG"))
++      fprintf(stderr, "tu5 vs params: offset=%u vec4, size=%u dwords, struct=%zu dwords, constlen=%u\n",
++              offset, size, sizeof(struct ir3_driver_params_vs) / 4, v->constlen);
++
+    struct ir3_driver_params_vs p = {
+       .draw_id = 0,
+       .vtxid_base = info->indexed ? (uint32_t)info->vertex_offset
+@@ -802,6 +811,9 @@ tu5_emit_gfx_ssbo_state(struct tu_cmd_buffer *cmd,
+    if (!shader->num_ssbos)
+       return;
+ 
++   if (getenv("TU5_GFX_DEBUG"))
++      fprintf(stderr, "tu5 ssbo state: num_ssbos=%u\n", shader->num_ssbos);
++
+    struct tu_descriptor_state *ds =
+       tu_get_descriptors_state(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+    uint64_t addrs[TU5_MAX_SSBOS] = {};
+@@ -879,6 +891,117 @@ tu5_emit_gfx_ssbo_state(struct tu_cmd_buffer *cmd,
+    }
+ }
+ 
++static uint64_t
++tu5_get_gfx_ubo_addr(struct tu_cmd_buffer *cmd, unsigned binding)
++{
++   struct tu_descriptor_state *ds =
++      tu_get_descriptors_state(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
++   struct tu_descriptor_set *dset = ds->sets[0];
++
++   if (!dset || binding >= dset->layout->binding_count || !dset->mapped_ptr)
++      return 0;
++
++   const struct tu_descriptor_set_binding_layout *bl =
++      &dset->layout->binding[binding];
++   if (bl->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
++       bl->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)
++      return 0;
++
++   const uint32_t *desc = dset->mapped_ptr + bl->offset / 4;
++   uint64_t addr = desc[0] | ((uint64_t)(desc[1] & 0x1ffff) << 32);
++   uint32_t dyn = 0;
++   if (bl->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC &&
++       dset->dynamic_descriptors) {
++      dyn = dset->dynamic_descriptors[bl->dynamic_offset_offset / 4];
++      addr += dyn;
++   }
++   if (getenv("TU5_GFX_DEBUG")) {
++      fprintf(stderr, "tu5 ubo binding=%u type=%u addr=%llx size=%u dyn=%u\n",
++              binding, bl->type, (unsigned long long)addr, desc[2], dyn);
++   }
++   return addr;
++}
++
++static void
++tu5_emit_gfx_ubo_state(struct tu_cmd_buffer *cmd,
++                       struct tu_shader *shader,
++                       enum a4xx_state_block shader_sb)
++{
++   if (!shader || !shader->num_ubos)
++      return;
++
++   const struct ir3_shader_variant *v = shader->variant;
++   const struct ir3_const_allocations *allocs = &v->const_state->allocs;
++
++   if (getenv("TU5_GFX_DEBUG")) {
++      fprintf(stderr, "tu5 ubo state: stage=%u num_ubos=%u constlen=%u base=%u can=%d\n",
++              v->type, shader->num_ubos, v->constlen,
++              allocs->consts[IR3_CONST_ALLOC_UBO_PTRS].offset_vec4 * 4,
++              ir3_const_can_upload(allocs, IR3_CONST_ALLOC_UBO_PTRS, v->constlen));
++      fprintf(stderr, "  driver params at vec4 %u, ssbo sizes at vec4 %u\n",
++              allocs->consts[IR3_CONST_ALLOC_DRIVER_PARAMS].offset_vec4,
++              allocs->consts[IR3_CONST_ALLOC_SSBO_SIZES].offset_vec4);
++   }
++
++   /* a5xx UBO loads are lowered to global loads through pointers stored in
++    * const state. Without uploading them the shader dereferences garbage
++    * (usually 0) and the GPU hangs.
++    */
++   if (ir3_const_can_upload(allocs, IR3_CONST_ALLOC_UBO_PTRS, v->constlen)) {
++      uint32_t off = allocs->consts[IR3_CONST_ALLOC_UBO_PTRS].offset_vec4;
++      unsigned slots = MAX2((unsigned)shader->num_ubos,
++                            v->const_state->num_ubos);
++      unsigned units = DIV_ROUND_UP(slots * 2, 4);
++
++      tu_cs_emit_pkt7(&cmd->cs, CP_LOAD_STATE4, 3 + units * 4);
++      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_0_DST_OFF(off) |
++                               CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
++                               CP_LOAD_STATE4_0_STATE_BLOCK(shader_sb) |
++                               CP_LOAD_STATE4_0_NUM_UNIT(units));
++      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
++                               CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
++      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
++
++      for (unsigned i = 0; i < units * 4; i++) {
++         unsigned slot = i / 2;
++         uint32_t addr_lo = 0, addr_hi = 0;
++         if (slot < shader->num_ubos) {
++            uint64_t addr =
++               tu5_get_gfx_ubo_addr(cmd, shader->ubo_map[slot].binding);
++            addr_lo = addr;
++            addr_hi = addr >> 32;
++         }
++         tu_cs_emit(&cmd->cs, (i & 1) ? addr_hi : addr_lo);
++      }
++   }
++
++   const struct ir3_ubo_analysis_state *state = &v->const_state->ubo_state;
++   for (unsigned i = 0; i < state->num_enabled; i++) {
++      const struct ir3_ubo_range *r = &state->range[i];
++      uint32_t size = r->end - r->start;
++      if (!size || !ir3_const_can_upload(allocs, IR3_CONST_ALLOC_UBO_RANGES,
++                                         v->constlen))
++         continue;
++
++      uint64_t addr = tu5_get_gfx_ubo_addr(cmd, r->ubo.block);
++      if (!addr)
++         continue;
++
++      unsigned units = size / 16;
++      if (!units)
++         continue;
++
++      tu_cs_emit_pkt7(&cmd->cs, CP_LOAD_STATE4, 3);
++      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_0_DST_OFF(r->offset / 16) |
++                               CP_LOAD_STATE4_0_STATE_SRC(SS4_INDIRECT) |
++                               CP_LOAD_STATE4_0_STATE_BLOCK(shader_sb) |
++                               CP_LOAD_STATE4_0_NUM_UNIT(units));
++      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
++                               CP_LOAD_STATE4_1_EXT_SRC_ADDR((uint32_t)(addr + r->start)));
++      tu_cs_emit(&cmd->cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI((addr + r->start) >> 32));
++   }
++}
++
+ static void
+ tu5_emit_global_state(struct tu_cmd_buffer *cmd)
+ {
+@@ -962,6 +1085,15 @@ tu5_clear_color_dword(VkFormat format, const VkClearColorValue *color,
+       bgra = true;
+       srgb = true;
+       break;
++   case VK_FORMAT_A2R10G10B10_UNORM_PACK32: {
++      /* A2R10G10B10: A in bits 31:30, R 29:20, G 19:10, B 9:0. */
++      uint32_t r = (uint32_t)(CLAMP(rgba[0], 0.0f, 1.0f) * 1023.0f + 0.5f);
++      uint32_t g = (uint32_t)(CLAMP(rgba[1], 0.0f, 1.0f) * 1023.0f + 0.5f);
++      uint32_t b = (uint32_t)(CLAMP(rgba[2], 0.0f, 1.0f) * 1023.0f + 0.5f);
++      uint32_t a = (uint32_t)(CLAMP(rgba[3], 0.0f, 1.0f) * 3.0f + 0.5f);
++      *out = b | (g << 10) | (r << 20) | (a << 30);
++      return true;
++   }
+    default:
+       return false;
+    }
+@@ -1039,6 +1171,13 @@ tu5_clear_depth_dword(VkFormat format, float depth, uint32_t stencil,
+    }
+ }
+ 
++static uint64_t
++tu5_ds_clear_size(const struct fdl6_view *view, uint64_t height)
++{
++   uint64_t linear = (uint64_t)view->pitch * height;
++   return view->layer_size > linear ? view->layer_size : linear;
++}
++
+ static void
+ tu5_clear_ds_attachment(struct tu_cmd_buffer *cmd, unsigned idx,
+                         const struct tu_render_pass_attachment *att,
+@@ -1070,7 +1209,7 @@ tu5_clear_ds_attachment(struct tu_cmd_buffer *cmd, unsigned idx,
+                        " h=%" PRIu64 " val=%08x\n", dview->base_addr,
+                        dview->pitch, height, value);
+             tu5_fill_linear(&cmd->cs, dview->base_addr,
+-                            (uint64_t)dview->pitch * height, value);
++                            tu5_ds_clear_size(dview, height), value);
+          }
+       } else if (clear_depth || clear_stencil) {
+          if (!att->load) {
+@@ -1078,7 +1217,7 @@ tu5_clear_ds_attachment(struct tu_cmd_buffer *cmd, unsigned idx,
+             if (tu5_clear_depth_dword(format, depth, stencil,
+                                       clear_stencil, &value))
+                tu5_fill_linear(&cmd->cs, dview->base_addr,
+-                               (uint64_t)dview->pitch * height, value);
++                               tu5_ds_clear_size(dview, height), value);
+          } else if (tu5_gfx_debug()) {
+             fprintf(stderr, "  clear: D24S8 %s-only clear would clobber the "
+                             "other aspect, skipped\n",
+@@ -1088,11 +1227,16 @@ tu5_clear_ds_attachment(struct tu_cmd_buffer *cmd, unsigned idx,
+       return;
+    }
+ 
++   if (tu5_gfx_debug())
++      fprintf(stderr, "  clear ds: vkfmt=%d depth=%d stencil=%d value=%f base=%" PRIx64 " pitch=%u layer=%u\n",
++              format, clear_depth, clear_stencil, depth, dview->base_addr,
++              dview->pitch, dview->layer_size);
++
+    if (clear_depth) {
+       uint32_t value;
+       if (tu5_clear_depth_dword(format, depth, 0, false, &value))
+          tu5_fill_linear(&cmd->cs, dview->base_addr,
+-                         (uint64_t)dview->pitch * height, value);
++                         tu5_ds_clear_size(dview, height), value);
+       else if (tu5_gfx_debug())
+          fprintf(stderr, "  clear: unsupported depth format %d, skipped\n",
+                  format);
+@@ -1109,7 +1253,7 @@ tu5_clear_ds_attachment(struct tu_cmd_buffer *cmd, unsigned idx,
+       } else {
+          uint32_t value = (stencil & 0xff) * 0x01010101u;
+          tu5_fill_linear(&cmd->cs, sview->base_addr,
+-                         (uint64_t)sview->pitch * height, value);
++                         tu5_ds_clear_size(sview, height), value);
+       }
+    }
+ }
+@@ -1625,11 +1769,13 @@ tu5_emit_zs(struct tu_cmd_buffer *cmd,
+ 
+    uint32_t depth_cntl =
+       A5XX_RB_DEPTH_CNTL_ZFUNC(dyn->ds.depth.compare_op);
+-   if (dyn->ds.depth.test_enable)
+-      depth_cntl |= A5XX_RB_DEPTH_CNTL_Z_TEST_ENABLE |
+-                    A5XX_RB_DEPTH_CNTL_Z_READ_ENABLE;
+-   if (dyn->ds.depth.write_enable)
+-      depth_cntl |= A5XX_RB_DEPTH_CNTL_Z_WRITE_ENABLE;
++   if (!getenv("TU5_GFX_NODEPTH")) {
++      if (dyn->ds.depth.test_enable)
++         depth_cntl |= A5XX_RB_DEPTH_CNTL_Z_TEST_ENABLE |
++                       A5XX_RB_DEPTH_CNTL_Z_READ_ENABLE;
++      if (dyn->ds.depth.write_enable)
++         depth_cntl |= A5XX_RB_DEPTH_CNTL_Z_WRITE_ENABLE;
++   }
+    tu5_emit_reg(cs, REG_A5XX_RB_DEPTH_CNTL, depth_cntl);
+ 
+    bool fragz = fs->writes_pos;
+@@ -1959,6 +2105,8 @@ tu5_draw(struct tu_cmd_buffer *cmd, const struct tu5_draw_info *info)
+    tu5_emit_vs_driver_params(cmd, vs_shader, info);
+    tu5_emit_gfx_ssbo_state(cmd, vs_shader, SB4_VS_SHADER);
+    tu5_emit_gfx_ssbo_state(cmd, fs_shader, SB4_FS_SHADER);
++   tu5_emit_gfx_ubo_state(cmd, vs_shader, SB4_VS_SHADER);
++   tu5_emit_gfx_ubo_state(cmd, fs_shader, SB4_FS_SHADER);
+    tu5_emit_textures(cmd, vs_shader, SB4_VS_TEX);
+    tu5_emit_textures(cmd, fs_shader, SB4_FS_TEX);
+    tu5_emit_reg(cs, REG_A5XX_TPL1_VS_TEX_COUNT, vs_shader->num_textures);
+@@ -2011,6 +2159,11 @@ tu5_draw(struct tu_cmd_buffer *cmd, const struct tu5_draw_info *info)
+                         CP_DRAW_INDX_OFFSET_0_VIS_CULL(vismode);
+ 
+    if (info->indexed) {
++      if (getenv("TU5_GFX_DEBUG"))
++         fprintf(stderr, "tu5: indexed draw count=%u first=%u voff=%d inst=%u va=%" PRIx64 " max=%u size=%u\n",
++                 info->index_count, info->first_index, info->vertex_offset,
++                 info->instance_count, cmd->state.index_va,
++                 cmd->state.max_index_count, cmd->state.index_size);
+       enum a4xx_index_size index_size;
+       switch (cmd->state.index_size) {
+       case 1: index_size = INDEX4_SIZE_8_BIT; break;
+@@ -2056,3 +2209,151 @@ tu5_draw(struct tu_cmd_buffer *cmd, const struct tu5_draw_info *info)
+    if (getenv("TU5_GFX_DUMPCS"))
+       tu5_dump_cs(cmd);
+ }
++
++/* a5xx hardware index fetch through CP_DRAW_INDX_OFFSET(DMA) does not work in
++ * our sysmem/bypass path. Expand the indexed draw on the CPU: build a small
++ * temporary vertex buffer with vertices in index order and issue a regular
++ * non-indexed draw. This is enough for triangle-list style content (vkcube).
++ */
++
++void
++tu5_draw_indexed(struct tu_cmd_buffer *cmd, const struct tu5_draw_info *info)
++{
++   struct tu5_draw_info local = *info;
++   info = &local;
++
++   if (!info->indexed || !cmd->state.index_buffer || info->instance_count != 1) {
++      tu5_draw(cmd, info);
++      return;
++   }
++
++   struct tu_buffer *ibuf = cmd->state.index_buffer;
++   if (tu_bo_map(cmd->device, ibuf->bo, NULL) != VK_SUCCESS) {
++      tu5_draw(cmd, info);
++      return;
++   }
++
++   unsigned index_bytes;
++   switch (cmd->state.index_size) {
++   case INDEX4_SIZE_8_BIT:
++      index_bytes = 1;
++      break;
++   case INDEX4_SIZE_16_BIT:
++      index_bytes = 2;
++      break;
++   case INDEX4_SIZE_32_BIT:
++      index_bytes = 4;
++      break;
++   default:
++      tu5_draw(cmd, info);
++      return;
++   }
++
++   if (cmd->state.index_va < ibuf->bo->iova ||
++       cmd->state.index_va - ibuf->bo->iova >= ibuf->bo->size) {
++      tu5_draw(cmd, info);
++      return;
++   }
++
++   const uint8_t *idx = (const uint8_t *)ibuf->bo->map +
++      (cmd->state.index_va - ibuf->bo->iova) +
++      (size_t)info->first_index * index_bytes;
++
++   struct tu_cs_memory tmp[MAX_VBS] = {};
++   bool any = false;
++
++   for (unsigned b = 0; b < cmd->state.max_vbs_bound; b++) {
++      struct tu_buffer *vb = cmd->state.vb_buffer[b];
++      if (!vb || !cmd->state.vb[b].size)
++         continue;
++
++      unsigned stride = cmd->state.vi.bindings[b].stride;
++      if (!stride)
++         continue;
++
++      if (tu_bo_map(cmd->device, vb->bo, NULL) != VK_SUCCESS) {
++         tu5_draw(cmd, info);
++         return;
++      }
++
++      uint64_t size = (uint64_t)info->index_count * stride;
++      if (!size || size > 4 * 1024 * 1024) {
++         tu5_draw(cmd, info);
++         return;
++      }
++
++      if (tu_cs_alloc(&cmd->sub_cs, size, 16, &tmp[b]) != VK_SUCCESS) {
++         tu5_draw(cmd, info);
++         return;
++      }
++
++      uint64_t vb_off = cmd->state.vb[b].base - vb->bo->iova;
++      const uint8_t *src = (const uint8_t *)vb->bo->map + vb_off;
++
++      for (unsigned i = 0; i < info->index_count; i++) {
++         uint32_t index;
++         if (index_bytes == 1)
++            index = idx[i];
++         else if (index_bytes == 2)
++            index = ((const uint16_t *)idx)[i];
++         else
++            index = ((const uint32_t *)idx)[i];
++
++         index += info->vertex_offset;
++         if ((uint64_t)index * stride + stride > cmd->state.vb[b].size)
++            continue;
++
++         memcpy((uint8_t *)tmp[b].map + (uint64_t)i * stride,
++                src + (uint64_t)index * stride, stride);
++      }
++
++      any = true;
++   }
++
++   if (!any) {
++      if (getenv("TU5_GFX_DEBUG"))
++         fprintf(stderr, "tu5 indexed: no expandable bindings (count=%u max_vbs=%u)\n",
++                 info->index_count, cmd->state.max_vbs_bound);
++      tu5_draw(cmd, info);
++      return;
++   }
++
++   if (getenv("TU5_GFX_DEBUG")) {
++      fprintf(stderr, "tu5 indexed expand: count=%u max_vbs=%u\n",
++              info->index_count, cmd->state.max_vbs_bound);
++      for (unsigned b = 0; b < cmd->state.max_vbs_bound; b++) {
++         if (tmp[b].map)
++            fprintf(stderr, "  binding %u: stride=%u size=%llu -> tmp %llx\n",
++                    b, cmd->state.vi.bindings[b].stride,
++                    (unsigned long long)cmd->state.vb[b].size,
++                    (unsigned long long)tmp[b].iova);
++      }
++   }
++
++   uint64_t old_base[MAX_VBS] = {};
++   uint32_t old_size[MAX_VBS] = {};
++
++   for (unsigned b = 0; b < cmd->state.max_vbs_bound; b++) {
++      if (!tmp[b].map)
++         continue;
++      old_base[b] = cmd->state.vb[b].base;
++      old_size[b] = cmd->state.vb[b].size;
++      cmd->state.vb[b].base = tmp[b].iova;
++      cmd->state.vb[b].size =
++         (uint64_t)info->index_count * cmd->state.vi.bindings[b].stride;
++   }
++
++   struct tu5_draw_info nonindexed = *info;
++   nonindexed.indexed = false;
++   nonindexed.vertex_count = info->index_count;
++   nonindexed.first_vertex = 0;
++   nonindexed.vertex_offset = 0;
++   tu5_draw(cmd, &nonindexed);
++
++   for (unsigned b = 0; b < cmd->state.max_vbs_bound; b++) {
++      if (!tmp[b].map)
++         continue;
++      cmd->state.vb[b].base = old_base[b];
++      cmd->state.vb[b].size = old_size[b];
++   }
++}
+diff --git a/src/freedreno/vulkan/tu5_graphics.h b/src/freedreno/vulkan/tu5_graphics.h
+index e1bb992..7b89d94 100644
+--- a/src/freedreno/vulkan/tu5_graphics.h
++++ b/src/freedreno/vulkan/tu5_graphics.h
+@@ -26,6 +26,7 @@ struct tu5_draw_info {
+ };
+ 
+ void tu5_draw(struct tu_cmd_buffer *cmd, const struct tu5_draw_info *info);
++void tu5_draw_indexed(struct tu_cmd_buffer *cmd, const struct tu5_draw_info *info);
+ 
+ /* Apply the render-pass loadOp=CLEAR for color attachments. a5xx sysmem
+  * rendering has no GMEM, so this is done with a linear memory fill.
+diff --git a/src/freedreno/vulkan/tu_clear_blit.cc b/src/freedreno/vulkan/tu_clear_blit.cc
+index 959c0d6..d2f7d96 100644
+--- a/src/freedreno/vulkan/tu_clear_blit.cc
++++ b/src/freedreno/vulkan/tu_clear_blit.cc
+@@ -13,6 +13,7 @@
+ #include "util/format_rgb9e5.h"
+ #include "util/format_srgb.h"
+ #include "util/half_float.h"
++#include "util/u_pack_color.h"
+ 
+ #include "common/freedreno_gpu_event.h"
+ #include "common/freedreno_lrz.h"
+@@ -2935,6 +2936,24 @@ copy_compressed(VkFormat format,
+       *height = DIV_ROUND_UP(*height, block_height);
+ }
+ 
++/* a5xx sysmem path: buffer<->image copies are done on the CPU, since the
++ * images are linear and the common r2d path is not wired up for a5xx. */
++static VkResult
++tu5_copy_buffer_to_image(struct tu_device *device,
++                         struct tu_buffer *src_buffer,
++                         struct tu_image *dst_image,
++                         const VkBufferImageCopy2 *info);
++static VkResult
++tu5_copy_image_to_buffer(struct tu_device *device,
++                         struct tu_image *src_image,
++                         struct tu_buffer *dst_buffer,
++                         const VkBufferImageCopy2 *info);
++static VkResult
++tu5_copy_image_cpu(struct tu_device *device,
++                   struct tu_image *src_image,
++                   struct tu_image *dst_image,
++                   const VkImageCopy2 *info);
++
+ template <chip CHIP>
+ static void
+ tu_copy_buffer_to_image(struct tu_cmd_buffer *cmd,
+@@ -3070,6 +3089,18 @@ tu_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(tu_image, dst_image, pCopyBufferToImageInfo->dstImage);
+    VK_FROM_HANDLE(tu_buffer, src_buffer, pCopyBufferToImageInfo->srcBuffer);
+ 
++   if (cmd->device->physical_device->info->chip == 5) {
++      for (unsigned i = 0; i < pCopyBufferToImageInfo->regionCount; ++i) {
++         VkResult result = tu5_copy_buffer_to_image(cmd->device, src_buffer,
++                                                    dst_image,
++                                                    pCopyBufferToImageInfo->pRegions + i);
++         if (result != VK_SUCCESS)
++            vk_device_set_lost(&cmd->device->vk,
++                               "a5xx buffer->image copy failed");
++      }
++      return;
++   }
++
+    trace_start_copy_buffer_to_image(&cmd->trace, &cmd->cs, cmd, dst_image->vk.format);
+ 
+    for (unsigned i = 0; i < pCopyBufferToImageInfo->regionCount; ++i)
+@@ -3087,6 +3118,7 @@ TU_GENX(tu_CmdCopyBufferToImage2);
+ static void
+ tu_copy_memory_to_image(struct tu_device *device,
+                         struct tu_image *dst_image,
++                        char *image_map,
+                         const VkMemoryToImageCopyEXT *info,
+                         bool copy_memcpy)
+ {
+@@ -3125,7 +3157,7 @@ tu_copy_memory_to_image(struct tu_device *device,
+       fdl_tile_mode(layout, info->imageSubresource.mipLevel) != 0;
+ 
+    const char *src = static_cast<const char *>(info->pHostPointer);
+-   char *dst = static_cast<char *>(dst_image->map) + image_offset;
++   char *dst = image_map + image_offset;
+    for (unsigned layer = 0; layer < layers; layer++,
+         src += src_layer_stride, dst += dst_layer_stride) {
+       if (copy_memcpy) {
+@@ -3165,7 +3197,8 @@ tu_CopyMemoryToImageEXT(VkDevice _device,
+    assert(!dst_image->lrz_layout.lrz_total_size);
+ 
+    for (unsigned i = 0; i < info->regionCount; i++) {
+-      tu_copy_memory_to_image(device, dst_image, &info->pRegions[i],
++      tu_copy_memory_to_image(device, dst_image, static_cast<char *>(dst_image->map),
++                              &info->pRegions[i],
+                               info->flags & VK_HOST_IMAGE_COPY_MEMCPY_EXT);
+    }
+ 
+@@ -3291,6 +3324,18 @@ tu_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(tu_image, src_image, pCopyImageToBufferInfo->srcImage);
+    VK_FROM_HANDLE(tu_buffer, dst_buffer, pCopyImageToBufferInfo->dstBuffer);
+ 
++   if (cmd->device->physical_device->info->chip == 5) {
++      for (unsigned i = 0; i < pCopyImageToBufferInfo->regionCount; ++i) {
++         VkResult result = tu5_copy_image_to_buffer(cmd->device, src_image,
++                                                    dst_buffer,
++                                                    pCopyImageToBufferInfo->pRegions + i);
++         if (result != VK_SUCCESS)
++            vk_device_set_lost(&cmd->device->vk,
++                               "a5xx image->buffer copy failed");
++      }
++      return;
++   }
++
+    trace_start_copy_image_to_buffer(&cmd->trace, &cmd->cs, cmd, src_image->vk.format);
+ 
+    bool unaligned_store = false;
+@@ -3308,6 +3353,7 @@ TU_GENX(tu_CmdCopyImageToBuffer2);
+ static void
+ tu_copy_image_to_memory(struct tu_device *device,
+                         struct tu_image *src_image,
++                        const char *image_map,
+                         const VkImageToMemoryCopyEXT *info,
+                         bool copy_memcpy)
+ {
+@@ -3344,7 +3390,7 @@ tu_copy_image_to_memory(struct tu_device *device,
+    bool tiled =
+       fdl_tile_mode(layout, info->imageSubresource.mipLevel) != 0;
+ 
+-   const char *src = static_cast<const char *>(src_image->map) + image_offset;
++   const char *src = image_map + image_offset;
+    char *dst = static_cast<char *>(info->pHostPointer);
+    for (unsigned layer = 0; layer < layers; layer++,
+         src += src_layer_stride, dst += dst_layer_stride) {
+@@ -3383,13 +3429,278 @@ tu_CopyImageToMemoryEXT(VkDevice _device,
+    VK_FROM_HANDLE(tu_image, image, info->srcImage);
+ 
+    for (unsigned i = 0; i < info->regionCount; i++) {
+-      tu_copy_image_to_memory(device, image, &info->pRegions[i],
++      tu_copy_image_to_memory(device, image, static_cast<const char *>(image->map), &info->pRegions[i],
+                               info->flags & VK_HOST_IMAGE_COPY_MEMCPY_EXT);
+    }
+ 
+    return VK_SUCCESS;
+ }
+ 
++static void
++tu_copy_image_to_image_cpu(struct tu_device *device,
++                           struct tu_image *src_image,
++                           struct tu_image *dst_image,
++                           const VkImageCopy2 *info,
++                           bool copy_memcpy,
++                           const char *src_map,
++                           char *dst_map);
++
++static VkResult
++tu5_image_cpu_map(struct tu_device *device,
++                  struct tu_image *image,
++                  char **map)
++{
++   if (image->mem->bo->map == NULL) {
++      VkResult result = tu_bo_map(device, image->mem->bo, NULL);
++      if (result != VK_SUCCESS)
++         return result;
++   }
++
++   *map = static_cast<char *>(image->mem->bo->map) + image->mem_offset;
++   return VK_SUCCESS;
++}
++
++static VkResult
++tu5_buffer_cpu_map(struct tu_device *device, struct tu_buffer *buffer)
++{
++   if (buffer->bo->map == NULL)
++      return tu_bo_map(device, buffer->bo, NULL);
++   return VK_SUCCESS;
++}
++
++static VkResult
++tu5_copy_image_cpu(struct tu_device *device,
++                   struct tu_image *src_image,
++                   struct tu_image *dst_image,
++                   const VkImageCopy2 *info)
++{
++   char *src_map, *dst_map;
++   VkResult result = tu5_image_cpu_map(device, src_image, &src_map);
++   if (result != VK_SUCCESS)
++      return result;
++   result = tu5_image_cpu_map(device, dst_image, &dst_map);
++   if (result != VK_SUCCESS)
++      return result;
++
++   tu_copy_image_to_image_cpu(device, src_image, dst_image, info, false,
++                              src_map, dst_map);
++   return VK_SUCCESS;
++}
++
++static VkResult
++tu5_copy_buffer_cpu(struct tu_device *device,
++                    struct tu_buffer *src_buffer,
++                    struct tu_buffer *dst_buffer,
++                    const VkBufferCopy2 *region)
++{
++   VkResult result = tu5_buffer_cpu_map(device, src_buffer);
++   if (result != VK_SUCCESS)
++      return result;
++   result = tu5_buffer_cpu_map(device, dst_buffer);
++   if (result != VK_SUCCESS)
++      return result;
++
++   if (src_buffer->bo->cached_non_coherent) {
++      tu_bo_sync_cache(device, src_buffer->bo, region->srcOffset,
++                       region->size, TU_MEM_SYNC_CACHE_FROM_GPU);
++   }
++
++   memcpy(static_cast<char *>(dst_buffer->bo->map) + region->dstOffset,
++          static_cast<char *>(src_buffer->bo->map) + region->srcOffset,
++          region->size);
++
++   if (dst_buffer->bo->cached_non_coherent) {
++      tu_bo_sync_cache(device, dst_buffer->bo, region->dstOffset,
++                       region->size, TU_MEM_SYNC_CACHE_TO_GPU);
++   }
++
++   return VK_SUCCESS;
++}
++
++static VkResult
++tu5_fill_buffer_cpu(struct tu_device *device,
++                    struct tu_buffer *buffer,
++                    VkDeviceSize offset,
++                    VkDeviceSize size,
++                    uint32_t data)
++{
++   VkResult result = tu5_buffer_cpu_map(device, buffer);
++   if (result != VK_SUCCESS)
++      return result;
++
++   char *ptr = static_cast<char *>(buffer->bo->map) + offset;
++   char *end = ptr + size;
++   while (ptr + 4 <= end) {
++      memcpy(ptr, &data, 4);
++      ptr += 4;
++   }
++   if (ptr < end)
++      memcpy(ptr, &data, end - ptr);
++
++   if (buffer->bo->cached_non_coherent) {
++      tu_bo_sync_cache(device, buffer->bo, offset, size,
++                       TU_MEM_SYNC_CACHE_TO_GPU);
++   }
++   return VK_SUCCESS;
++}
++
++static VkResult
++tu5_update_buffer_cpu(struct tu_device *device,
++                      struct tu_buffer *buffer,
++                      VkDeviceSize offset,
++                      VkDeviceSize size,
++                      const void *data)
++{
++   VkResult result = tu5_buffer_cpu_map(device, buffer);
++   if (result != VK_SUCCESS)
++      return result;
++
++   memcpy(static_cast<char *>(buffer->bo->map) + offset, data, size);
++
++   if (buffer->bo->cached_non_coherent) {
++      tu_bo_sync_cache(device, buffer->bo, offset, size,
++                       TU_MEM_SYNC_CACHE_TO_GPU);
++   }
++   return VK_SUCCESS;
++}
++
++static bool
++tu5_can_cpu_clear_color(struct tu_image *image,
++                        const VkImageSubresourceRange *range)
++{
++   if (vk_format_is_compressed(image->vk.format) || image->layout[0].ubwc)
++      return false;
++
++   unsigned level_count = range->levelCount == VK_REMAINING_MIP_LEVELS ?
++      image->vk.mip_levels - range->baseMipLevel : range->levelCount;
++   for (unsigned l = 0; l < level_count; l++) {
++      if (fdl_tile_mode(&image->layout[0], range->baseMipLevel + l) != 0)
++         return false;
++   }
++   return true;
++}
++
++static VkResult
++tu5_clear_color_image_cpu(struct tu_device *device,
++                          struct tu_image *image,
++                          const VkClearColorValue *pColor,
++                          const VkImageSubresourceRange *range)
++{
++   enum pipe_format format = vk_format_to_pipe_format(image->vk.format);
++   const struct fdl_layout *layout = &image->layout[0];
++   uint32_t cpp = util_format_get_blocksize(format);
++
++   union util_color uc = {};
++   util_pack_color_union(format, &uc,
++                         reinterpret_cast<const union pipe_color_union *>(pColor));
++
++   char *map;
++   VkResult result = tu5_image_cpu_map(device, image, &map);
++   if (result != VK_SUCCESS)
++      return result;
++
++   unsigned level_count = range->levelCount == VK_REMAINING_MIP_LEVELS ?
++      image->vk.mip_levels - range->baseMipLevel : range->levelCount;
++   bool is_3d = image->vk.image_type == VK_IMAGE_TYPE_3D;
++
++   for (unsigned l = 0; l < level_count; l++) {
++      unsigned level = range->baseMipLevel + l;
++      uint32_t width = u_minify(image->vk.extent.width, level);
++      uint32_t height = u_minify(image->vk.extent.height, level);
++      uint32_t layers = is_3d ? u_minify(image->vk.extent.depth, level) :
++         range->layerCount;
++
++      uint32_t pitch = fdl_pitch(layout, level);
++
++      for (uint32_t layer = 0; layer < layers; layer++) {
++         uint32_t image_offset =
++            fdl_surface_offset(layout, level, range->baseArrayLayer + layer);
++         char *row = map + image_offset;
++
++         /* Build one row and replicate it; padding is left untouched. */
++         for (uint32_t x = 0; x < width; x++)
++            memcpy(row + x * cpp, &uc, cpp);
++         for (uint32_t y = 1; y < height; y++)
++            memcpy(row + y * pitch, row, width * cpp);
++      }
++   }
++
++   if (image->mem->bo->cached_non_coherent) {
++      tu_bo_sync_cache(device, image->mem->bo, image->mem_offset,
++                       VK_WHOLE_SIZE, TU_MEM_SYNC_CACHE_TO_GPU);
++   }
++   return VK_SUCCESS;
++}
++
++static VkResult
++tu5_copy_buffer_to_image(struct tu_device *device,
++                         struct tu_buffer *src_buffer,
++                         struct tu_image *dst_image,
++                         const VkBufferImageCopy2 *info)
++{
++   VkResult result = tu_bo_map(device, src_buffer->bo, NULL);
++   if (result != VK_SUCCESS)
++      return result;
++
++   char *image_map;
++   result = tu5_image_cpu_map(device, dst_image, &image_map);
++   if (result != VK_SUCCESS)
++      return result;
++
++   if (src_buffer->bo->cached_non_coherent) {
++      tu_bo_sync_cache(device, src_buffer->bo, info->bufferOffset,
++                       VK_WHOLE_SIZE, TU_MEM_SYNC_CACHE_FROM_GPU);
++   }
++
++   VkMemoryToImageCopyEXT copy = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_TO_IMAGE_COPY_EXT,
++      .pHostPointer = static_cast<char *>(src_buffer->bo->map) + info->bufferOffset,
++      .memoryRowLength = info->bufferRowLength,
++      .memoryImageHeight = info->bufferImageHeight,
++      .imageSubresource = info->imageSubresource,
++      .imageOffset = info->imageOffset,
++      .imageExtent = info->imageExtent,
++   };
++
++   tu_copy_memory_to_image(device, dst_image, image_map, &copy, false);
++   return VK_SUCCESS;
++}
++
++static VkResult
++tu5_copy_image_to_buffer(struct tu_device *device,
++                         struct tu_image *src_image,
++                         struct tu_buffer *dst_buffer,
++                         const VkBufferImageCopy2 *info)
++{
++   VkResult result = tu_bo_map(device, dst_buffer->bo, NULL);
++   if (result != VK_SUCCESS)
++      return result;
++
++   char *image_map;
++   result = tu5_image_cpu_map(device, src_image, &image_map);
++   if (result != VK_SUCCESS)
++      return result;
++
++   VkImageToMemoryCopyEXT copy = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_TO_MEMORY_COPY_EXT,
++      .pHostPointer = static_cast<char *>(dst_buffer->bo->map) + info->bufferOffset,
++      .memoryRowLength = info->bufferRowLength,
++      .memoryImageHeight = info->bufferImageHeight,
++      .imageSubresource = info->imageSubresource,
++      .imageOffset = info->imageOffset,
++      .imageExtent = info->imageExtent,
++   };
++
++   tu_copy_image_to_memory(device, src_image, image_map, &copy, false);
++
++   if (dst_buffer->bo->cached_non_coherent) {
++      tu_bo_sync_cache(device, dst_buffer->bo, info->bufferOffset,
++                       VK_WHOLE_SIZE, TU_MEM_SYNC_CACHE_TO_GPU);
++   }
++
++   return VK_SUCCESS;
++}
++
+ 
+ /* Tiled formats don't support swapping, which means that we can't support
+  * formats that require a non-WZYX swap like B8G8R8A8 natively. Also, some
+@@ -3657,6 +3968,30 @@ tu_CmdCopyImage2(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(tu_image, src_image, pCopyImageInfo->srcImage);
+    VK_FROM_HANDLE(tu_image, dst_image, pCopyImageInfo->dstImage);
+ 
++   if (cmd->device->physical_device->info->chip == 5) {
++      for (uint32_t i = 0; i < pCopyImageInfo->regionCount; ++i) {
++         VkImageCopy2 info = pCopyImageInfo->pRegions[i];
++         if (src_image->vk.format == VK_FORMAT_D32_SFLOAT_S8_UINT &&
++             dst_image->vk.format == VK_FORMAT_D32_SFLOAT_S8_UINT) {
++            u_foreach_bit(b, info.dstSubresource.aspectMask) {
++               info.srcSubresource.aspectMask = BIT(b);
++               info.dstSubresource.aspectMask = BIT(b);
++               VkResult result = tu5_copy_image_cpu(cmd->device, src_image,
++                                                    dst_image, &info);
++               if (result != VK_SUCCESS)
++                  vk_device_set_lost(&cmd->device->vk,
++                                     "a5xx image copy failed");
++            }
++            continue;
++         }
++         VkResult result = tu5_copy_image_cpu(cmd->device, src_image,
++                                              dst_image, &info);
++         if (result != VK_SUCCESS)
++            vk_device_set_lost(&cmd->device->vk, "a5xx image copy failed");
++      }
++      return;
++   }
++
+    trace_start_copy_image(&cmd->trace, &cmd->cs, cmd, src_image->vk.format,
+                           dst_image->vk.format);
+ 
+@@ -3689,7 +4024,9 @@ tu_copy_image_to_image_cpu(struct tu_device *device,
+                            struct tu_image *src_image,
+                            struct tu_image *dst_image,
+                            const VkImageCopy2 *info,
+-                           bool copy_memcpy)
++                           bool copy_memcpy,
++                           const char *src_map,
++                           char *dst_map)
+ {
+    unsigned src_plane = tu6_plane_index(src_image->vk.format,
+                                         info->srcSubresource.aspectMask);
+@@ -3738,8 +4075,8 @@ tu_copy_image_to_image_cpu(struct tu_device *device,
+    bool dst_tiled =
+       fdl_tile_mode(dst_layout, info->dstSubresource.mipLevel) != 0;
+ 
+-   const char *src = static_cast<const char *>(src_image->map) + src_image_offset;
+-   char *dst = static_cast<char *>(dst_image->map) + dst_image_offset;
++   const char *src = src_map + src_image_offset;
++   char *dst = dst_map + dst_image_offset;
+    for (unsigned layer = 0; layer < layers_to_copy; layer++,
+         src += src_layer_stride, dst += dst_layer_stride) {
+       if (src_image->mem->bo->cached_non_coherent) {
+@@ -3849,14 +4186,18 @@ tu_CopyImageToImageEXT(VkDevice _device,
+             info.srcSubresource.aspectMask = BIT(b);
+             info.dstSubresource.aspectMask = BIT(b);
+             tu_copy_image_to_image_cpu(device, src_image, dst_image, &info,
+-                                       copy_memcpy);
++                                       copy_memcpy,
++                                       static_cast<const char *>(src_image->map),
++                                       static_cast<char *>(dst_image->map));
+          }
+          continue;
+       }
+ 
+       tu_copy_image_to_image_cpu(device, src_image, dst_image,
+                                  pCopyImageToImageInfo->pRegions + i,
+-                                 copy_memcpy);
++                                 copy_memcpy,
++                                 static_cast<const char *>(src_image->map),
++                                 static_cast<char *>(dst_image->map));
+    }
+ 
+    return VK_SUCCESS;
+@@ -3930,6 +4271,17 @@ tu_CmdCopyBuffer2(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(tu_buffer, src_buffer, pCopyBufferInfo->srcBuffer);
+    VK_FROM_HANDLE(tu_buffer, dst_buffer, pCopyBufferInfo->dstBuffer);
+ 
++   if (cmd->device->physical_device->info->chip == 5) {
++      for (unsigned i = 0; i < pCopyBufferInfo->regionCount; ++i) {
++         VkResult result = tu5_copy_buffer_cpu(cmd->device, src_buffer,
++                                               dst_buffer,
++                                               pCopyBufferInfo->pRegions + i);
++         if (result != VK_SUCCESS)
++            vk_device_set_lost(&cmd->device->vk, "a5xx buffer copy failed");
++      }
++      return;
++   }
++
+    trace_start_copy_buffer(&cmd->trace, &cmd->cs, cmd);
+ 
+    /* Choose the largest common block size for all copy regions
+@@ -3980,6 +4332,14 @@ tu_CmdUpdateBuffer(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(tu_buffer, buffer, dstBuffer);
+ 
++   if (cmd->device->physical_device->info->chip == 5) {
++      VkResult result = tu5_update_buffer_cpu(cmd->device, buffer, dstOffset,
++                                              dataSize, pData);
++      if (result != VK_SUCCESS)
++         vk_device_set_lost(&cmd->device->vk, "a5xx update buffer failed");
++      return;
++   }
++
+    struct tu_cs_memory tmp;
+    VkResult result = tu_cs_alloc(&cmd->sub_cs, DIV_ROUND_UP(dataSize, 64), 64 / 4, &tmp);
+    if (result != VK_SUCCESS) {
+@@ -4073,10 +4433,19 @@ tu_CmdFillBuffer(VkCommandBuffer commandBuffer,
+                  VkDeviceSize fillSize,
+                  uint32_t data)
+ {
++   VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(tu_buffer, buffer, dstBuffer);
+ 
+    fillSize = vk_buffer_range(&buffer->vk, dstOffset, fillSize);
+ 
++   if (cmd->device->physical_device->info->chip == 5) {
++      VkResult result = tu5_fill_buffer_cpu(cmd->device, buffer, dstOffset,
++                                            fillSize, data);
++      if (result != VK_SUCCESS)
++         vk_device_set_lost(&cmd->device->vk, "a5xx fill buffer failed");
++      return;
++   }
++
+    VkDeviceAddress dst_va = vk_buffer_address(&buffer->vk, dstOffset);
+ 
+    tu_cmd_fill_buffer<CHIP>(commandBuffer, dst_va, fillSize, data);
+@@ -4493,6 +4862,27 @@ tu_CmdClearColorImage(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(tu_image, image, image_h);
+ 
++   if (cmd->device->physical_device->info->chip == 5) {
++      bool cpu_clear = true;
++      for (unsigned i = 0; i < rangeCount; i++) {
++         if (pRanges[i].aspectMask != VK_IMAGE_ASPECT_COLOR_BIT ||
++             !tu5_can_cpu_clear_color(image, &pRanges[i]))
++            cpu_clear = false;
++      }
++      if (cpu_clear) {
++         for (unsigned i = 0; i < rangeCount; i++) {
++            VkResult result = tu5_clear_color_image_cpu(cmd->device, image,
++                                                        pColor, &pRanges[i]);
++            if (result != VK_SUCCESS) {
++               vk_device_set_lost(&cmd->device->vk,
++                                  "a5xx clear color image failed");
++               return;
++            }
++         }
++         return;
++      }
++   }
++
+    trace_start_clear_color_image(&cmd->trace, &cmd->cs, cmd, image->vk.format);
+ 
+    bool use_generic_clear = use_generic_clear_for_image_clear(cmd, image);
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index 6dfd567..4dca8ac 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -4705,10 +4705,12 @@ tu_CmdBindVertexBuffers2(VkCommandBuffer commandBuffer,
+ 
+    for (uint32_t i = 0; i < bindingCount; i++) {
+       if (pBuffers[i] == VK_NULL_HANDLE) {
++         cmd->state.vb_buffer[firstBinding + i] = NULL;
+          cmd->state.vb[firstBinding + i].base = 0;
+          cmd->state.vb[firstBinding + i].size = 0;
+       } else {
+          struct tu_buffer *buf = tu_buffer_from_handle(pBuffers[i]);
++         cmd->state.vb_buffer[firstBinding + i] = buf;
+          cmd->state.vb[firstBinding + i].base = vk_buffer_address(&buf->vk, pOffsets[i]);
+          cmd->state.vb[firstBinding + i].size =
+             vk_buffer_range(&buf->vk, pOffsets[i], pSizes ? pSizes[i] : VK_WHOLE_SIZE);
+@@ -4765,6 +4767,7 @@ tu_CmdBindIndexBuffer2KHR(VkCommandBuffer commandBuffer,
+     */
+    vk_cmd_set_index_buffer_type(&cmd->vk, indexType);
+ 
++   cmd->state.index_buffer = buf;
+    if (buf) {
+       cmd->state.index_va = vk_buffer_address(&buf->vk, offset);
+       cmd->state.max_index_count = size >> index_shift;
+@@ -4777,6 +4780,21 @@ tu_CmdBindIndexBuffer2KHR(VkCommandBuffer commandBuffer,
+ }
+ TU_GENX(tu_CmdBindIndexBuffer2KHR);
+ 
++/* vkCmdBindIndexBuffer is a core 1.0 entrypoint but the driver only has the
++ * 2KHR variant. Without this wrapper the generated weak symbol is a no-op
++ * and indexed draws read address 0. */
++template <chip CHIP>
++VKAPI_ATTR void VKAPI_CALL
++tu_CmdBindIndexBuffer(VkCommandBuffer commandBuffer,
++                      VkBuffer buffer,
++                      VkDeviceSize offset,
++                      VkIndexType indexType)
++{
++   tu_CmdBindIndexBuffer2KHR<CHIP>(commandBuffer, buffer, offset,
++                                   VK_WHOLE_SIZE, indexType);
++}
++TU_GENX(tu_CmdBindIndexBuffer);
++
+ template <chip CHIP>
+ static void
+ tu6_emit_descriptor_sets(struct tu_cmd_buffer *cmd,
+@@ -9384,7 +9402,7 @@ tu_CmdDrawIndexed(VkCommandBuffer commandBuffer,
+          .first_index = firstIndex,
+          .vertex_offset = vertexOffset,
+       };
+-      tu5_draw(cmd, &info);
++      tu5_draw_indexed(cmd, &info);
+       return;
+    }
+ 
+@@ -10585,6 +10603,14 @@ tu_barrier(struct tu_cmd_buffer *cmd,
+            const VkDependencyInfo *dep_infos,
+            bool no_sync)
+ {
++   /* The a5xx implementation is sysmem-only and all resources are managed
++    * from the CPU side (copies/clears are plain memcpy/memset plus explicit
++    * cache maintenance). The generic a6xx cache-flush packets emitted for
++    * barriers hang the GPU, and there is no GPU-side state to synchronize.
++    */
++   if (cmd->device->physical_device->info->chip == 5)
++      return;
++
+    VkPipelineStageFlags2 srcStage = 0;
+    VkPipelineStageFlags2 dstStage = 0;
+    BITMASK_ENUM(tu_cmd_access_mask) src_flags = 0;
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.h b/src/freedreno/vulkan/tu_cmd_buffer.h
+index e8b8067..c428089 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.h
++++ b/src/freedreno/vulkan/tu_cmd_buffer.h
+@@ -555,6 +555,10 @@ struct tu_cmd_state
+    uint32_t max_index_count;
+    uint8_t index_size;
+ 
++   /* a5xx CPU index expansion needs the original buffer objects. */
++   struct tu_buffer *index_buffer;
++   struct tu_buffer *vb_buffer[MAX_VBS];
++
+    /* because streamout base has to be 32-byte aligned
+     * there is an extra offset to deal with when it is
+     * unaligned
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index 97fa4c0..70c0bbd 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -4048,6 +4048,16 @@ tu_MapMemory2KHR(VkDevice _device, const VkMemoryMapInfoKHR *pMemoryMapInfo, voi
+    if (result != VK_SUCCESS)
+       return result;
+ 
++   /* The a5xx memory type is advertised as HOST_COHERENT, but the CPU cache
++    * still has to be invalidated when the GPU may have written the BO.
++    * Do it on map/unmap so applications do not have to remember to call
++    * vkInvalidateMappedMemoryRanges/vkFlushMappedMemoryRanges for direct
++    * image/staging writes.
++    */
++   if (device->physical_device->has_cached_non_coherent_memory)
++      tu_bo_sync_cache(device, mem->bo, pMemoryMapInfo->offset,
++                       pMemoryMapInfo->size, TU_MEM_SYNC_CACHE_FROM_GPU);
++
+    *ppData = static_cast<char *>(mem->bo->map) + pMemoryMapInfo->offset;
+    return VK_SUCCESS;
+ }
+@@ -4061,6 +4071,11 @@ tu_UnmapMemory2KHR(VkDevice _device, const VkMemoryUnmapInfoKHR *pMemoryUnmapInf
+    if (mem == NULL)
+       return VK_SUCCESS;
+ 
++   /* Flush CPU writes back to the GPU before the mapping disappears. */
++   if (device->physical_device->has_cached_non_coherent_memory)
++      tu_bo_sync_cache(device, mem->bo, 0, VK_WHOLE_SIZE,
++                       TU_MEM_SYNC_CACHE_TO_GPU);
++
+    return tu_bo_unmap(device, mem->bo, pMemoryUnmapInfo->flags & VK_MEMORY_UNMAP_RESERVE_BIT_EXT);
+ }
+ static VkResult
+@@ -4549,7 +4564,9 @@ tu_GetMemoryFdKHR(VkDevice _device,
+    if (memory->image) {
+       struct fdl_layout *l = &memory->image->layout[0];
+       uint64_t modifier;
+-      if (l->ubwc) {
++      if (device->physical_device->info->chip == 5) {
++         modifier = DRM_FORMAT_MOD_LINEAR;
++      } else if (l->ubwc) {
+          modifier = DRM_FORMAT_MOD_QCOM_COMPRESSED;
+       } else if (l->tile_mode == 2) {
+          modifier = DRM_FORMAT_MOD_QCOM_TILED2;
+diff --git a/src/freedreno/vulkan/tu_image.cc b/src/freedreno/vulkan/tu_image.cc
+index 198984d..9442024 100644
+--- a/src/freedreno/vulkan/tu_image.cc
++++ b/src/freedreno/vulkan/tu_image.cc
+@@ -996,11 +996,15 @@ tu_CreateImage(VkDevice _device,
+          modifier = DRM_FORMAT_MOD_LINEAR;
+          for (unsigned i = 0; i < mod_info->drmFormatModifierCount; i++) {
+             if (mod_info->pDrmFormatModifiers[i] == DRM_FORMAT_MOD_QCOM_COMPRESSED &&
+-                !compression_disabled)
++                !compression_disabled &&
++                device->physical_device->info->chip != 5)
+                modifier = DRM_FORMAT_MOD_QCOM_COMPRESSED;
+          }
+       } else {
+          modifier = drm_explicit_info->drmFormatModifier;
++         if (device->physical_device->info->chip == 5 &&
++             modifier == DRM_FORMAT_MOD_QCOM_COMPRESSED)
++            return vk_error(device, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
+          assert(modifier == DRM_FORMAT_MOD_LINEAR ||
+                 modifier == DRM_FORMAT_MOD_QCOM_COMPRESSED);
+          assert(modifier != DRM_FORMAT_MOD_QCOM_COMPRESSED ||
+diff --git a/src/freedreno/vulkan/tu_pass.cc b/src/freedreno/vulkan/tu_pass.cc
+index 318b171..d2ca313 100644
+--- a/src/freedreno/vulkan/tu_pass.cc
++++ b/src/freedreno/vulkan/tu_pass.cc
+@@ -993,6 +993,12 @@ attachment_set_ops(struct tu_device *device,
+          att->store_stencil = true;
+       break;
+    default:
++      /* Plain depth formats (D16_UNORM, D32_SFLOAT, X8_D24...) arrive here
++       * with the generic COLOR clear bit. Convert it to the depth aspect so
++       * the sysmem clear path actually clears them.
++       */
++      if (att->clear_mask && vk_format_has_depth(att->format))
++         att->clear_mask = VK_IMAGE_ASPECT_DEPTH_BIT;
+       break;
+    }
+ }
+diff --git a/src/freedreno/vulkan/tu_wsi.cc b/src/freedreno/vulkan/tu_wsi.cc
+index 4db6d5e..19310ed 100644
+--- a/src/freedreno/vulkan/tu_wsi.cc
++++ b/src/freedreno/vulkan/tu_wsi.cc
+@@ -49,7 +49,11 @@ tu_wsi_init(struct tu_physical_device *physical_device)
+    if (result != VK_SUCCESS)
+       return result;
+ 
+-   physical_device->wsi_device.supports_modifiers = true;
++   /* a5xx only supports linear color images; advertising DRM format
++    * modifiers would make the Wayland WSI pick QCOM_COMPRESSED and export a
++    * buffer whose layout does not match the modifier. */
++   physical_device->wsi_device.supports_modifiers =
++      physical_device->info->chip != 5;
+    physical_device->wsi_device.can_present_on_device =
+       tu_wsi_can_present_on_device;
+ 

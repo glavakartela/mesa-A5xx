@@ -92,3 +92,13 @@ English: [STABILITY.en.md](STABILITY.en.md)
   ненулевые. Открытый вопрос — остаточные белые полоски/«кирпичики»:
   проверить с `sysmem` + no-scanout; если остаются, тестировать
   `noblit,inorder,gmem` или собирать/обновлять fd5 GL.
+
+## Прогон 3: vkmark (2026-11-22)
+
+- `samplerAnisotropy` для chip 5 (`43823af`) позволил vkmark создать
+  Vulkan-устройство.
+- Сцены shading, texture, effect2d, desktop и cube проходят.
+- Двухминутный стресс: без reset/fault, температура ~49–53 °C.
+- Отдельно проверен kernel progress-aware fix (`7.2-whyred-drivers`):
+  длинный непрерываемый draw не вызывает ложный reset; на реальном hang
+  ALU останавливается и watchdog срабатывает.
