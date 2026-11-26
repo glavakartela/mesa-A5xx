@@ -452,8 +452,17 @@ tu_get_features(struct tu_physical_device *pdevice,
    *features = (struct vk_features) { false };
 
    if (pdevice->info->chip == 5) {
-      /* a5xx compute MVP: expose only what the isolated compute path can
-       * actually honor.
+      /* Curated a5xx (SDM660 / Adreno 509) feature set.
+       *
+       * Chip 5 does not implement most of the common Turnip paths: it is
+       * sysmem-only, has no MSAA/LRZ/tile load/store, bindful descriptors,
+       * and a separate graphics/compute emission path (tu5_graphics.cc /
+       * tu5_compute.cc).  Advertising the full a6xx feature set made every
+       * app that queried features enable code that cannot work, and
+       * Gamescope in particular fails vkCreateDevice because it needs
+       * dynamicRendering/timelineSemaphore/scalarBlockLayout and friends.
+       *
+       * Keep this list in sync with what the tu5_* paths really implement.
        */
       features->robustBufferAccess = true;
       features->shaderInt64 = true;
@@ -461,6 +470,33 @@ tu_get_features(struct tu_physical_device *pdevice,
        * anisotropically; the hardware supports it.
        */
       features->samplerAnisotropy = true;
+      features->shaderClipDistance = true;
+      features->shaderCullDistance = true;
+      /* Gamescope needs this for its composite shaders.  The tu5 compute
+       * path does not emit storage images yet, so this is only a promise
+       * for the shader compiler; it will fail at pipeline creation until
+       * image support lands.
+       */
+      features->shaderStorageImageWriteWithoutFormat = true;
+
+      /* Vulkan 1.1 */
+      features->samplerYcbcrConversion = true;
+
+      /* Vulkan 1.2 */
+      features->scalarBlockLayout = true;
+      features->timelineSemaphore = true;
+
+      /* Vulkan 1.3 */
+      features->dynamicRendering = true;
+
+      /* VK_EXT_robustness2: Gamescope enables nullDescriptor. */
+      features->nullDescriptor = true;
+
+#ifdef TU_USE_WSI_PLATFORM
+      /* Gamescope enables both for its Wayland/X11 swapchain paths. */
+      features->presentId = true;
+      features->presentWait = true;
+#endif
       return;
    }
 

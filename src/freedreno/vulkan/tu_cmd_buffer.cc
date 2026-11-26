@@ -7504,6 +7504,21 @@ tu_CmdBeginRendering(VkCommandBuffer commandBuffer,
       cmd->state.attachments[a] = view;
    }
 
+   if (cmd->device->physical_device->info->chip == 5) {
+      /* Minimal sysmem dynamic rendering, mirroring the chip-5
+       * vkCmdBeginRenderPass2 path: the attachment pointers and clear
+       * values above are all tu5_draw needs, and clears are applied here
+       * because there is no GMEM load op to do it later.
+       *
+       * a5xx has no MSRTSS, so skip tu_setup_dynamic_msrtss(); the rest of
+       * this function emits a6xx-only GMEM/LRZ state.
+       */
+      cmd->state.suspending = false;
+      cmd->state.resuming = false;
+      tu5_clear_attachments(cmd);
+      return;
+   }
+
    VkResult result = tu_setup_dynamic_msrtss(cmd);
    if (result != VK_SUCCESS) {
       vk_command_buffer_set_error(&cmd->vk, result);
@@ -10526,6 +10541,17 @@ tu_CmdEndRendering2EXT(VkCommandBuffer commandBuffer,
                        const VkRenderingEndInfoEXT *pRenderingEndInfo)
 {
    VK_FROM_HANDLE(tu_cmd_buffer, cmd_buffer, commandBuffer);
+
+   if (cmd_buffer->device->physical_device->info->chip == 5) {
+      /* Symmetric to the chip-5 vkCmdEndRenderPass2 path: draws were
+       * emitted directly into cmd->cs by tu5_draw, there is no deferred
+       * draw_cs to render, and the attachment array lives inside the
+       * command buffer, so it must not be freed here.
+       */
+      tu_reset_render_pass(cmd_buffer);
+      cmd_buffer->state.total_renderpasses++;
+      return;
+   }
 
    if (cmd_buffer->state.suspending) {
       cmd_buffer->state.suspended_pass.lrz = cmd_buffer->state.lrz;
