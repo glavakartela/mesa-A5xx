@@ -13,7 +13,29 @@ Mesa-дерево: `~/mesa-a5xx-work`, ветка master.
 - `51828ed` — f32 texture samples;
 - `04fdfbf` — bindful tex/sampler tables в pipeline cache;
 - `a6e57fe` — публичный installer и документация (тег `a5xx-vkcube-working`);
-- `43823af` — `samplerAnisotropy` для vkmark.
+- `43823af` — `samplerAnisotropy` для vkmark;
+- `d464adf`, `03f70b8`, `8a500e6`, `7674e83`, `dc8c5d2` — Gamescope:
+  набор фич, dynamic rendering, bindful storage images и compute-текстуры
+  (master head `71f3bca`).
+
+## Gamescope (2026-11-26)
+
+Gamescope 3.17 запускается и композитит на a5xx. Для chip 5 теперь
+рекламируются `dynamicRendering`, `timelineSemaphore`,
+`scalarBlockLayout`, `samplerYcbcrConversion`, `nullDescriptor`,
+`shaderStorageImageWriteWithoutFormat`, `presentId`/`presentWait`,
+`swapchainMaintenance1` и `presentId2`/`presentWait2`. Compute-путь
+получил bindful storage images (`imageStore` через STIB, `imageLoad`
+через ISAM/LDIB) и sampled textures; `vkCmdBeginRendering`/
+`vkCmdEndRendering` обходят GMEM/LRZ.
+
+Проверено: `gamescope --backend=wayland --expose-wayland` внутри KWin,
+внутри него `vkcube --wsi wayland` — куб LUNAR виден на экране.
+Headless-бэкенд также создаёт swapchain клиента.
+
+Ограничения: сэмплерные массивы — только элемент 0; `imageLoad` в
+read-write storage image пока не пишет; `gamescopectl screenshot` в
+headless-режиме роняет Gamescope (обычный рендер не затронут).
 
 Последний прогон vkmark: сцены shading/texture/effect2d/desktop/cube
 проходят, 2-минутный стресс без reset/fault, ~49–53 °C.

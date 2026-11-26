@@ -15,7 +15,29 @@ Target: Xiaomi Redmi Note 5 / whyred, Adreno 509 (a5xx, sysmem path).
 - `51828ed` — keep texture samples f32;
 - `04fdfbf` — keep bindful tex/sampler tables in the pipeline cache blob;
 - `a6e57fe` — public installer and docs (tag `a5xx-vkcube-working`);
-- `43823af` — expose `samplerAnisotropy` for vkmark.
+- `43823af` — expose `samplerAnisotropy` for vkmark;
+- `d464adf`, `03f70b8`, `8a500e6`, `7674e83`, `dc8c5d2` — Gamescope:
+  feature set, dynamic rendering, bindful storage images and compute
+  textures (master head `71f3bca`).
+
+## Gamescope (2026-11-26)
+
+Gamescope 3.17 now starts and composites on a5xx.  Chip 5 advertises
+`dynamicRendering`, `timelineSemaphore`, `scalarBlockLayout`,
+`samplerYcbcrConversion`, `nullDescriptor`,
+`shaderStorageImageWriteWithoutFormat`, `presentId`/`presentWait`,
+`swapchainMaintenance1` and `presentId2`/`presentWait2`.  The compute
+path gained bindful storage images (`imageStore` via STIB, `imageLoad`
+via ISAM/LDIB) and sampled textures; `vkCmdBeginRendering`/
+`vkCmdEndRendering` bypass GMEM/LRZ.
+
+Verified: `gamescope --backend=wayland --expose-wayland` nested in KWin
+with `vkcube --wsi wayland` inside it shows the LUNAR cube.  The
+headless backend also creates the client swapchain.
+
+Limits: sampler arrays use element 0 only; `imageLoad` into a read-write
+storage image does not write yet; `gamescopectl screenshot` in the
+headless backend crashes Gamescope (normal rendering is unaffected).
 
 The latest vkmark run passes shading/texture/effect2d/desktop/cube scenes,
 survives a two-minute stress run with no reset or fault at ~49–53 °C.
