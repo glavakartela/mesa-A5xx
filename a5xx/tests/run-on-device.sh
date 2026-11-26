@@ -6,10 +6,11 @@
 set -eu
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-BUILD=${BUILD:-$HERE/../build-a5xx}
+BUILD=${BUILD:-$HERE/../../build-a5xx}
 HOST=${1:-${WHYRED_HOST:-}}
 [ -n "$HOST" ] || { echo "usage: $0 user@host" >&2; exit 2; }
 PORT=${PORT:-22}
+TEST=${TEST:-tu5_test}
 DEST=/tmp/tu5-test
 
 SO="$BUILD/src/freedreno/vulkan/libvulkan_freedreno.so"
@@ -19,16 +20,16 @@ if [ ! -f "$SO" ]; then
 fi
 
 ssh -p "$PORT" "$HOST" "mkdir -p $DEST"
-scp -P "$PORT" "$SO" "$HERE/tu5_test" "$HOST:$DEST/"
+scp -P "$PORT" "$SO" "$HERE/$TEST" "$HOST:$DEST/"
 
 ssh -p "$PORT" "$HOST" "cat > $DEST/freedreno_a5xx.json <<'EOF'
 {
    \"file_format_version\": \"1.0.0\",
    \"ICD\": {
       \"library_path\": \"$DEST/libvulkan_freedreno.so\",
-      \"api_version\": \"1.0.0\"
+      \"api_version\": \"1.3.368\"
    }
 }
 EOF"
 
-ssh -p "$PORT" "$HOST" "VK_ICD_FILENAMES=$DEST/freedreno_a5xx.json VK_DRIVER_FILES=$DEST/freedreno_a5xx.json VK_LOADER_DEBUG=error $DEST/tu5_test"
+ssh -p "$PORT" "$HOST" "VK_ICD_FILENAMES=$DEST/freedreno_a5xx.json VK_DRIVER_FILES=$DEST/freedreno_a5xx.json VK_LOADER_DEBUG=error $DEST/$TEST"
