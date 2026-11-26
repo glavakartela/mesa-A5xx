@@ -109,7 +109,7 @@ struct tu_shader
    } samp_map[TU5_MAX_SAMPLERS];
    uint8_t num_images;
    struct {
-      uint8_t set, binding;
+      uint8_t set, binding, element;
    } image_map[TU5_MAX_IMAGES];
    enum pipe_format image_format[TU5_MAX_IMAGES];
 

@@ -436,7 +436,8 @@ tu5_emit_image_state(struct tu_cmd_buffer *cmd)
       if (bl->type != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
          continue;
 
-      const uint32_t *src = dset->mapped_ptr + bl->offset / 4;
+      const uint32_t *src = dset->mapped_ptr + bl->offset / 4 +
+                            shader->image_map[i].element * bl->size / 4;
       srcs[i] = src;
 
       /* A6xx and A5xx share the format field position in TEX_CONST/MEMOBJ,

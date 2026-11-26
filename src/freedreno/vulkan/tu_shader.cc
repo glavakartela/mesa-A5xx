@@ -4076,7 +4076,8 @@ tu_shader_create(struct tu_device *dev,
             shader->image_map[var->data.binding + i].set =
                var->data.descriptor_set;
             shader->image_map[var->data.binding + i].binding =
-               var->data.binding + i;
+               var->data.binding;
+            shader->image_map[var->data.binding + i].element = i;
             shader->image_format[var->data.binding + i] =
                var->data.image.format;
          }
