@@ -762,6 +762,28 @@ lower_image_deref(struct tu_device *dev, nir_builder *b,
 {
    bool descriptor_valid = true;
    nir_deref_instr *deref = nir_src_as_deref(instr->src[0]);
+   nir_variable *var = nir_deref_instr_get_variable(deref);
+
+   if (dev->physical_device->info->chip == 5) {
+      /* a5xx is bindful: the isam/ldgb/stib slot is the image index, which
+       * we define to be the Vulkan binding (set 0 only).  Dynamic image
+       * arrays are not representable with an immediate slot; fall back to
+       * element 0 so the compiler still sees a constant.
+       */
+      unsigned binding = var->data.binding;
+      if (deref->deref_type == nir_deref_type_array &&
+          nir_src_is_const(deref->arr.index))
+         binding += nir_src_as_uint(deref->arr.index);
+
+      if (binding >= TU5_MAX_IMAGES)
+         return;
+
+      nir_builder b_at = nir_builder_at(nir_before_instr(&instr->instr));
+      nir_rewrite_image_intrinsic(instr, nir_imm_int(&b_at, binding),
+                                  nir_image_intrinsic_type_bindless);
+      return;
+   }
+
    nir_def *bindless = build_bindless(dev, b, deref, 0, shader, layout, 0, false,
                                       &descriptor_valid);
    if ((instr->intrinsic == nir_intrinsic_image_deref_load ||
@@ -3706,6 +3728,8 @@ tu_shader_cache_process_blob(IO &io, struct tu_shader *shader)
    io.bytes(shader->tex_map, sizeof(shader->tex_map));
    io.u8(shader->num_samplers);
    io.bytes(shader->samp_map, sizeof(shader->samp_map));
+   io.u8(shader->num_images);
+   io.bytes(shader->image_map, sizeof(shader->image_map));
 
    io.variant(shader->variant);
 
@@ -4021,6 +4045,35 @@ tu_shader_create(struct tu_device *dev,
          }
          shader->ubo_map[var->data.binding].set = var->data.descriptor_set;
          shader->ubo_map[var->data.binding].binding = var->data.binding;
+      }
+   }
+
+   if (dev->physical_device->info->chip == 5) {
+      /* Bindful storage images: the hardware slot is the Vulkan binding,
+       * descriptor set 0 only.  Record the map used by tu5_emit_image_state()
+       * and reserve all array elements.  A 0xff binding marks a hole.
+       */
+      memset(shader->image_map, 0xff, sizeof(shader->image_map));
+
+      nir_foreach_variable_with_modes (var, nir, nir_var_image) {
+         unsigned array_size = 1;
+         if (glsl_type_is_array(var->type))
+            array_size = MAX2(glsl_array_size(var->type), 1);
+
+         if (var->data.descriptor_set != 0 ||
+             var->data.binding + array_size > TU5_MAX_IMAGES) {
+            vk_free(&dev->vk.alloc, shader);
+            return VK_ERROR_FEATURE_NOT_PRESENT;
+         }
+
+         for (unsigned i = 0; i < array_size; i++) {
+            shader->image_map[var->data.binding + i].set =
+               var->data.descriptor_set;
+            shader->image_map[var->data.binding + i].binding =
+               var->data.binding + i;
+         }
+         shader->num_images = MAX2(shader->num_images,
+                                   var->data.binding + array_size);
       }
    }
 

@@ -22,6 +22,7 @@
 
 #include "tu_cmd_buffer.h"
 #include "tu_shader.h"
+#include "tu5_graphics.h"
 
 #include "ir3/ir3_shader.h"
 #include "tu5_regs.h"
@@ -332,8 +333,7 @@ tu5_get_ubo_addr(struct tu_cmd_buffer *cmd, unsigned binding)
 
 static void
 tu5_emit_ubo_state(struct tu_cmd_buffer *cmd)
-{
-   struct tu_shader *shader = cmd->state.shaders[MESA_SHADER_COMPUTE];
+{   struct tu_shader *shader = cmd->state.shaders[MESA_SHADER_COMPUTE];
    const struct ir3_shader_variant *v = shader->variant;
 
    if (!shader->num_ubos)
@@ -396,6 +396,105 @@ tu5_emit_ubo_state(struct tu_cmd_buffer *cmd)
    }
 }
 
+/* Storage images on a5xx use two state blocks:
+ *  - the TEX block holds a 12-dword TEX_CONST for imageLoad(),
+ *  - the SSBO block holds a 2-dword descriptor for imageStore() at slot
+ *    v->num_ssbos + image index.
+ * The image index is the Vulkan binding, set by lower_image_deref().
+ */
+static void
+tu5_emit_image_state(struct tu_cmd_buffer *cmd)
+{
+   struct tu_shader *shader = cmd->state.shaders[MESA_SHADER_COMPUTE];
+   const struct ir3_shader_variant *v = shader->variant;
+
+   if (!shader->num_images)
+      return;
+
+   struct tu_descriptor_state *ds =
+      tu_get_descriptors_state(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
+   struct tu_cs *cs = &cmd->cs;
+
+   for (unsigned i = 0; i < shader->num_images; i++) {
+      unsigned set = shader->image_map[i].set;
+      unsigned binding = shader->image_map[i].binding;
+
+      if (binding == 0xff || set != 0)
+         continue;
+
+      const struct tu_descriptor_set *dset = ds->sets[0];
+      if (!dset || binding >= dset->layout->binding_count ||
+          !dset->mapped_ptr)
+         continue;
+
+      const struct tu_descriptor_set_binding_layout *bl =
+         &dset->layout->binding[binding];
+      if (bl->type != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+         continue;
+
+      const uint32_t *src = dset->mapped_ptr + bl->offset / 4;
+
+      /* A6xx and A5xx share the format field position in TEX_CONST/MEMOBJ,
+       * while the SSBO descriptor has its own, smaller field layout.
+       */
+      uint32_t fmt = (src[0] >> 22) & 0xff;
+      uint32_t swap = (src[0] >> 30) & 0x3;
+      uint32_t width = src[1] & 0x7fff;
+      uint32_t height = (src[1] >> 15) & 0x1fff;
+      uint32_t depth = (src[5] >> 17) & 0x1fff;
+
+      if (v->image_mapping.image_to_tex[i] != UAV_INVALID) {
+         unsigned slot = v->image_mapping.image_to_tex[i] +
+                         v->image_mapping.tex_base;
+         uint32_t tex[12];
+
+         tu5_texture_descriptor(src, tex);
+
+         tu_cs_emit_pkt7(cs, CP_LOAD_STATE4, 3 + 12);
+         tu_cs_emit(cs, CP_LOAD_STATE4_0_DST_OFF(slot) |
+                          CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
+                          CP_LOAD_STATE4_0_STATE_BLOCK(SB4_CS_TEX) |
+                          CP_LOAD_STATE4_0_NUM_UNIT(1));
+         tu_cs_emit(cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
+                          CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
+         tu_cs_emit(cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
+         for (unsigned j = 0; j < 12; j++)
+            tu_cs_emit(cs, tex[j]);
+      }
+
+      /* The address is stored byte-aligned in the A6xx descriptor; the
+       * low five bits are always zero (32-byte alignment).
+       */
+      uint64_t addr = (uint64_t)src[4] |
+                      ((uint64_t)(src[5] & 0x1ffff) << 32);
+      unsigned slot = v->num_ssbos + i;
+
+      tu_cs_emit_pkt7(cs, CP_LOAD_STATE4, 3 + 2);
+      tu_cs_emit(cs, CP_LOAD_STATE4_0_DST_OFF(slot) |
+                       CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
+                       CP_LOAD_STATE4_0_STATE_BLOCK(SB4_CS_SSBO) |
+                       CP_LOAD_STATE4_0_NUM_UNIT(1));
+      tu_cs_emit(cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
+                       CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
+      tu_cs_emit(cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
+      tu_cs_emit(cs, A5XX_SSBO_1_0_FMT(fmt) |
+                     A5XX_SSBO_1_0_SWAP(swap) |
+                     A5XX_SSBO_1_0_WIDTH(width));
+      tu_cs_emit(cs, A5XX_SSBO_1_1_HEIGHT(height) |
+                     A5XX_SSBO_1_1_DEPTH(depth));
+
+      tu_cs_emit_pkt7(cs, CP_LOAD_STATE4, 3 + 2);
+      tu_cs_emit(cs, CP_LOAD_STATE4_0_DST_OFF(slot) |
+                       CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
+                       CP_LOAD_STATE4_0_STATE_BLOCK(SB4_CS_SSBO) |
+                       CP_LOAD_STATE4_0_NUM_UNIT(1));
+      tu_cs_emit(cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_UBO) |
+                       CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
+      tu_cs_emit(cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
+      tu_cs_emit_qw(cs, addr);
+   }
+}
+
 void
 tu5_dispatch(struct tu_cmd_buffer *cmd, const struct tu_dispatch_info *info)
 {
@@ -421,12 +520,28 @@ tu5_dispatch(struct tu_cmd_buffer *cmd, const struct tu_dispatch_info *info)
    tu_cs_emit(&cmd->cs, 0x12);
    tu_cs_emit_pkt7(&cmd->cs, CP_WAIT_FOR_IDLE, 0);
 
+   /* Compute texturing needs the full TPL1 mode value (the kernel only
+    * programs the highest-bank-bit field, same as the graphics path).
+    */
+   uint32_t hbb = cmd->device->physical_device->info->highest_bank_bit;
+   if (hbb >= 13 && hbb <= 16) {
+      tu_cs_emit_pkt4(&cmd->cs, REG_A5XX_TPL1_MODE_CNTL, 1);
+      tu_cs_emit(&cmd->cs, 0x444 |
+                  A5XX_TPL1_MODE_CNTL_HIGHESTBANKBIT(hbb - 13));
+   }
+
    tu5_emit_flush(cmd);
    tu5_emit_driver_params(cmd, v, info);
    tu5_emit_push_consts(cmd, v);
    tu5_emit_ssbo_state(cmd);
    tu5_emit_ubo_state(cmd);
-   tu5_emit_ubo_state(cmd);
+
+   tu5_emit_textures(cmd, shader, SB4_CS_TEX,
+                     VK_PIPELINE_BIND_POINT_COMPUTE);
+   tu_cs_emit_pkt4(&cmd->cs, REG_A5XX_TPL1_CS_TEX_COUNT, 1);
+   tu_cs_emit(&cmd->cs,
+              shader->num_textures + v->image_mapping.num_tex);
+   tu5_emit_image_state(cmd);
 
    const uint16_t *local_size = v->local_size;
    const uint32_t *num_groups = info->blocks;

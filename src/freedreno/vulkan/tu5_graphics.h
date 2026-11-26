@@ -12,7 +12,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "tu_common.h"
+
 struct tu_cmd_buffer;
+struct tu_shader;
 
 struct tu5_draw_info {
    bool indexed;
@@ -32,5 +35,17 @@ void tu5_draw_indexed(struct tu_cmd_buffer *cmd, const struct tu5_draw_info *inf
  * rendering has no GMEM, so this is done with a linear memory fill.
  */
 void tu5_clear_attachments(struct tu_cmd_buffer *cmd);
+
+/* Convert an A6xx TEX_CONST descriptor (16 dwords) into the A5xx 12-dword
+ * layout used by texture/image state.
+ */
+void tu5_texture_descriptor(const uint32_t *src, uint32_t *dst);
+
+/* Emit sampler and texture state.  Shared between the graphics path
+ * (SB4_VS_TEX/SB4_FS_TEX) and the compute path (SB4_CS_TEX); the descriptor
+ * state depends on the bind point.
+ */
+void tu5_emit_textures(struct tu_cmd_buffer *cmd, struct tu_shader *shader,
+                       enum a4xx_state_block sb, VkPipelineBindPoint bind_point);
 
 #endif /* TU5_GRAPHICS_H */

@@ -1365,7 +1365,7 @@ tu5_emit_mrt(struct tu_cmd_buffer *cmd,
  * chip 5 images are linear, so force the tile mode. A5xx uses an explicit
  * base register instead of a bindless descriptor vector.
  */
-static void
+void
 tu5_texture_descriptor(const uint32_t *src, uint32_t *dst)
 {
    dst[0] = (src[0] & ~0x3u) | A5EN_TILE5_LINEAR;
@@ -1394,15 +1394,15 @@ tu5_sampler_descriptor(const uint32_t *src, uint32_t *dst)
    dst[3] = 0;
 }
 
-static void
+void
 tu5_emit_textures(struct tu_cmd_buffer *cmd, struct tu_shader *shader,
-                  enum a4xx_state_block sb)
+                  enum a4xx_state_block sb, VkPipelineBindPoint bind_point)
 {
    if (!shader->num_textures && !shader->num_samplers)
       return;
 
    struct tu_descriptor_state *ds =
-      tu_get_descriptors_state(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+      tu_get_descriptors_state(cmd, bind_point);
    uint32_t samplers[TU5_MAX_SAMPLERS][4] = {};
    uint32_t textures[TU5_MAX_TEXTURES][12] = {};
 
@@ -2122,8 +2122,8 @@ tu5_draw(struct tu_cmd_buffer *cmd, const struct tu5_draw_info *info)
    tu5_emit_gfx_ssbo_state(cmd, fs_shader, SB4_FS_SHADER);
    tu5_emit_gfx_ubo_state(cmd, vs_shader, SB4_VS_SHADER);
    tu5_emit_gfx_ubo_state(cmd, fs_shader, SB4_FS_SHADER);
-   tu5_emit_textures(cmd, vs_shader, SB4_VS_TEX);
-   tu5_emit_textures(cmd, fs_shader, SB4_FS_TEX);
+   tu5_emit_textures(cmd, vs_shader, SB4_VS_TEX, VK_PIPELINE_BIND_POINT_GRAPHICS);
+   tu5_emit_textures(cmd, fs_shader, SB4_FS_TEX, VK_PIPELINE_BIND_POINT_GRAPHICS);
    tu5_emit_reg(cs, REG_A5XX_TPL1_VS_TEX_COUNT, vs_shader->num_textures);
    tu5_emit_reg(cs, REG_A5XX_TPL1_FS_TEX_COUNT, fs_shader->num_textures);
    tu5_emit_rasterizer(cmd, vs_shader, fs_shader, linkage.max_loc);
