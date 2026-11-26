@@ -1,2 +1,5 @@
 tu5_*
 !tu5_*.c
+array_comp.inc
+ssbo_comp.inc
+ubo_comp.inc
