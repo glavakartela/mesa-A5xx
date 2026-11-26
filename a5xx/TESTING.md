@@ -31,7 +31,7 @@ for t in tu5_test tu5_ubo_test tu5_array_test \
          tu5_clear_test tu5_cleardraw_test tu5_bigclear_test \
          tu5_stencil_test tu5_mrt_test tu5_uvvb_test \
          tu5_texcopy_test tu5_imgops_test tu5_bufops_test \
-         tu5_clearcopy_test tu5_texvb_test; do
+         tu5_clearcopy_test tu5_texvb_test tu5_storage_image_test; do
   timeout 30 ./$t >/tmp/o 2>&1
   echo "$t rc=$? $(tail -1 /tmp/o)"
 done
@@ -43,6 +43,25 @@ timeout 30 ./tu5_blend_alpha_test
 Ожидаемо: все PASS (на момент тега — 29/29, включая WSI).
 `tu5_imgops_test` и `tu5_clearcopy_test` — texture clear/copy path,
 иногда нестабильны на WIP-текстурах; при hang нужен power-off.
+
+## Compute: storage images и фичи Gamescope
+
+`tu5_storage_image_test` проверяет Gamescope-подобный compute-путь:
+binding 0 — storage image (imageStore), binding 1 — combined image sampler
+(texelFetch). `tu5_storage_image_test grid` дополнительно пишет
+`gl_GlobalInvocationID`/`gl_WorkGroupID` в SSBO, чтобы проверить 2D-сетку.
+
+```sh
+timeout 30 ./tu5_storage_image_test
+# ожидаемо: PASS: compute sampled texture -> storage image
+timeout 30 ./tu5_storage_image_test grid
+# диагностика: "grid touched=4096 wrong=0/4096"
+```
+
+Для chip 5 Turnip теперь рекламирует `dynamicRendering`,
+`timelineSemaphore`, `scalarBlockLayout`, `samplerYcbcrConversion`,
+`nullDescriptor`, `presentId`/`presentWait` — минимальный набор, который
+требует Gamescope 3.17 при `vkCreateDevice`.
 
 ## WSI / vkcube
 

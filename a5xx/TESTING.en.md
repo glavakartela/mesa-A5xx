@@ -30,7 +30,7 @@ for t in tu5_test tu5_ubo_test tu5_array_test \
          tu5_stencil_test tu5_mrt_test tu5_uvvb_test \
          tu5_texcopy_test tu5_ubo_gfx_test tu5_idx_test \
          tu5_wsi_test tu5_wl_wsi_test tu5_bufops_test \
-         tu5_clearcopy_test; do
+         tu5_clearcopy_test tu5_storage_image_test; do
   timeout 30 ./$t >/tmp/o 2>&1
   echo "$t rc=$? $(tail -1 /tmp/o)"
 done
@@ -42,6 +42,25 @@ timeout 30 ./tu5_blend_alpha_test
 Expected: all PASS. At the working tag the smoke set is 27/27 (texvb excluded
 as WIP). `tu5_texvb_test` uses direct app-mapped image memory and is known to
 be flaky; `tu5_texcopy_test` covers the real staging path.
+
+## Compute: storage images and Gamescope features
+
+`tu5_storage_image_test` exercises the Gamescope-style compute path:
+binding 0 is a storage image (imageStore) and binding 1 a combined image
+sampler (texelFetch). `tu5_storage_image_test grid` additionally records
+`gl_GlobalInvocationID`/`gl_WorkGroupID` in an SSBO to validate the 2D grid.
+
+```sh
+timeout 30 ./tu5_storage_image_test
+# expected: PASS: compute sampled texture -> storage image
+timeout 30 ./tu5_storage_image_test grid
+# diagnostics: "grid touched=4096 wrong=0/4096"
+```
+
+For chip 5 Turnip now advertises `dynamicRendering`, `timelineSemaphore`,
+`scalarBlockLayout`, `samplerYcbcrConversion`, `nullDescriptor` and
+`presentId`/`presentWait`, the minimum Gamescope 3.17 requests at
+`vkCreateDevice`.
 
 ## WSI / vkcube
 

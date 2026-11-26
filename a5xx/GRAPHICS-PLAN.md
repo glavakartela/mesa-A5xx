@@ -1,8 +1,31 @@
 # A5xx Turnip: план графики
 
 Текущее: sysmem-графика с треугольниками, точками, линиями,
-depth/stencil, blending, MRT и текстурами. Последние коммиты: `98ea3ad`,
-`7c3da2b`, `ce84bda`.
+depth/stencil, blending, MRT и текстурами; compute с SSBO/UBO/push
+constants, storage images и sampled textures. Последние коммиты:
+`98ea3ad`, `7c3da2b`, `ce84bda` (графика), `d464adf`, `03f70b8`, `8a500e6`
+(Gamescope-фичи и compute-изображения).
+
+## Gamescope
+
+Gamescope 3.17 падал на `vkCreateDevice` с
+`VK_ERROR_FEATURE_NOT_PRESENT`: chip 5 рекламировал только три фичи.
+Теперь для chip 5 включены ровно те, что нужны Gamescope (и реализуемы):
+`dynamicRendering`, `timelineSemaphore`, `scalarBlockLayout`,
+`samplerYcbcrConversion`, `nullDescriptor`,
+`shaderStorageImageWriteWithoutFormat`, `presentId`, `presentWait`.
+`vkCmdBeginRendering`/`vkCmdEndRendering` для chip 5 обходят GMEM/LRZ и
+работают как sysmem render pass.
+
+Compute-путь получил bindful storage images: descriptor set 0, слот =
+Vulkan binding; `imageLoad` идёт через TEX-блок (ISAM/LDIB), `imageStore`
+через SSBO-блок (STIB). Для LDIB/STIB в const state загружаются
+bytes-per-pixel, pitch и layer size. Тест: `tu5_storage_image_test`
+(включая `grid`-режим для проверки 2D-сетки) — PASS на A509.
+
+Ограничения: сэмплерные массивы эмитятся только для элемента 0
+(Gamescope для одного слоя использует `s_samplers[0]`), динамические
+image-массивы не поддержаны.
 
 Сделано: CP_SET_RENDER_MODE(BYPASS), SP/HLSQ program state, VFD, VPC,
 RB MRT, sample mask, UCHE invalidate между процессами, swap как в fd5,

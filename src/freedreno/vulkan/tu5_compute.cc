@@ -10,12 +10,12 @@
  * Keep this file self-contained and only reachable through the runtime gen5
  * checks so that A6XX+ behavior is unchanged.
  *
- * Current MVP limitations (deliberate, to be lifted step by step):
- *  - storage buffers only, no UBOs/images/push constants,
- *  - storage buffers must live in descriptor set 0; the hardware slot is the
- *    Vulkan binding number (bindful isam/ldgb model of a5xx),
- *  - one descriptor per binding (no arrays),
- *  - get_ssbo_size() currently returns 0 on a5xx.
+ * Current bindful MVP limits:
+ *  - descriptor set 0 only; the hardware slot is the Vulkan binding for
+ *    SSBOs/textures/samplers and storage images,
+ *  - one descriptor per binding (sampler arrays are emitted for element 0),
+ *  - images must be 2D-style views; imageLoad/imageStore use the texture
+ *    and SSBO blocks respectively.
  */
 
 #include "tu5_compute.h"
