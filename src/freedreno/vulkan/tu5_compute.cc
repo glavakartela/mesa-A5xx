@@ -21,10 +21,13 @@
 #include "tu5_compute.h"
 
 #include "tu_cmd_buffer.h"
+#include "tu_descriptor_set.h"
 #include "tu_shader.h"
 #include "tu5_graphics.h"
 
 #include "ir3/ir3_shader.h"
+#include "util/format/u_format.h"
+#include "util/u_math.h"
 #include "tu5_regs.h"
 #include "tu5_gfx_regs.h"
 
@@ -414,6 +417,7 @@ tu5_emit_image_state(struct tu_cmd_buffer *cmd)
    struct tu_descriptor_state *ds =
       tu_get_descriptors_state(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
    struct tu_cs *cs = &cmd->cs;
+   const uint32_t *srcs[TU5_MAX_IMAGES] = {};
 
    for (unsigned i = 0; i < shader->num_images; i++) {
       unsigned set = shader->image_map[i].set;
@@ -433,6 +437,7 @@ tu5_emit_image_state(struct tu_cmd_buffer *cmd)
          continue;
 
       const uint32_t *src = dset->mapped_ptr + bl->offset / 4;
+      srcs[i] = src;
 
       /* A6xx and A5xx share the format field position in TEX_CONST/MEMOBJ,
        * while the SSBO descriptor has its own, smaller field layout.
@@ -493,6 +498,54 @@ tu5_emit_image_state(struct tu_cmd_buffer *cmd)
       tu_cs_emit(cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
       tu_cs_emit_qw(cs, addr);
    }
+
+   /* LDIB/STIB compute their byte offset from per-image constants:
+    * bytes-per-pixel, row pitch and layer size.  ir3 reserved the space in
+    * ir3_setup_const_state(); upload it now that the descriptors are known.
+    */
+   const struct ir3_const_state *const_state = v->const_state;
+   const struct ir3_const_allocations *allocs = &const_state->allocs;
+   const struct ir3_const_image_dims *image_dims = &const_state->image_dims;
+
+   if (!image_dims->count ||
+       !ir3_const_can_upload(allocs, IR3_CONST_ALLOC_IMAGE_DIMS, v->constlen))
+      return;
+
+   uint32_t dims[align(TU5_MAX_IMAGES * 3, 4)] = {};
+   unsigned mask = image_dims->mask;
+
+   while (mask) {
+      unsigned index = u_bit_scan(&mask);
+      if (index >= TU5_MAX_IMAGES || !srcs[index])
+         continue;
+
+      const uint32_t *src = srcs[index];
+      unsigned off = image_dims->off[index];
+      enum pipe_format format = shader->image_format[index];
+      unsigned bpp = format != PIPE_FORMAT_NONE ?
+         util_format_get_blocksize(format) : 4;
+
+      dims[off + 0] = bpp;
+      /* The descriptor stores pitch shifted by 7; the shader wants bytes. */
+      dims[off + 1] = (src[2] & A6XX_TEX_MEMOBJ_2_PITCH__MASK) >>
+                      A6XX_TEX_MEMOBJ_2_PITCH__SHIFT;
+      dims[off + 2] = (src[3] & 0x7fffff) << 12;
+   }
+
+   unsigned size = align(image_dims->count, 4);
+   unsigned base_vec4 =
+      allocs->consts[IR3_CONST_ALLOC_IMAGE_DIMS].offset_vec4;
+
+   tu_cs_emit_pkt7(cs, CP_LOAD_STATE4, 3 + size);
+   tu_cs_emit(cs, CP_LOAD_STATE4_0_DST_OFF(base_vec4) |
+                    CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
+                    CP_LOAD_STATE4_0_STATE_BLOCK(SB4_CS_SHADER) |
+                    CP_LOAD_STATE4_0_NUM_UNIT(size / 4));
+   tu_cs_emit(cs, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
+                    CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
+   tu_cs_emit(cs, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
+   for (unsigned i = 0; i < size; i++)
+      tu_cs_emit(cs, dims[i]);
 }
 
 void

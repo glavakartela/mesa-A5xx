@@ -1,0 +1,21 @@
+#version 450
+/* Grid probe: records each invocation's linear index and workgroup Y in a
+ * storage buffer, so the host can tell exactly which invocations ran.
+ * Also writes WorkGroupID.y to the storage image for the image path check.
+ */
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, rgba8) writeonly uniform image2D dst;
+layout(binding = 2, std430) writeonly buffer Out { uint v[]; } outb;
+
+void main()
+{
+   uvec2 coord = gl_GlobalInvocationID.xy;
+   uvec3 wg = gl_WorkGroupID;
+
+   outb.v[coord.x + coord.y * 64u] =
+      coord.x | (coord.y << 8) | (wg.y << 16);
+
+   float blue = float(wg.y) / 255.0;
+   imageStore(dst, ivec2(coord), vec4(0.25, 0.5, blue, 1.0));
+}

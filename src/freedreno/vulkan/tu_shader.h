@@ -111,6 +111,7 @@ struct tu_shader
    struct {
       uint8_t set, binding;
    } image_map[TU5_MAX_IMAGES];
+   enum pipe_format image_format[TU5_MAX_IMAGES];
 
    /* The dynamic buffer descriptor size for descriptor sets that we know
     * about. This is used when linking to piece together the sizes and from

@@ -1,4 +1,5 @@
 #include <vulkan/vulkan.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,6 +14,10 @@
 
 static const uint32_t comp_spv[] =
 #include "storage_image_comp.inc"
+;
+
+static const uint32_t grid_spv[] =
+#include "storage_image_grid_comp.inc"
 ;
 
 static uint32_t
@@ -114,8 +119,10 @@ image_barrier(VkCommandBuffer cmd, VkImage image,
 }
 
 int
-main(void)
+main(int argc, char **argv)
 {
+   bool grid_only = argc > 1 && !strcmp(argv[1], "grid");
+
    VkApplicationInfo app = {
       .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
       .pApplicationName = "tu5-storage-image",
@@ -223,6 +230,36 @@ main(void)
       vkUnmapMemory(device, dst_mem);
    }
 
+   const VkDeviceSize grid_size = (VkDeviceSize)width * height * sizeof(uint32_t);
+   VkBufferCreateInfo grid_buf_info = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+      .size = grid_size,
+      .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+   };
+   VkBuffer grid_buf;
+   CHECK(vkCreateBuffer(device, &grid_buf_info, NULL, &grid_buf));
+   VkMemoryRequirements grid_req;
+   vkGetBufferMemoryRequirements(device, grid_buf, &grid_req);
+   VkMemoryAllocateInfo grid_alloc = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize = grid_req.size,
+      .memoryTypeIndex =
+         find_memory_type(phys[0], grid_req.memoryTypeBits,
+                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+   };
+   VkDeviceMemory grid_mem;
+   CHECK(vkAllocateMemory(device, &grid_alloc, NULL, &grid_mem));
+   CHECK(vkBindBufferMemory(device, grid_buf, grid_mem, 0));
+   {
+      uint32_t *map;
+      CHECK(vkMapMemory(device, grid_mem, 0, VK_WHOLE_SIZE, 0, (void **)&map));
+      for (unsigned i = 0; i < width * height; i++)
+         map[i] = 0xdeadbeefu;
+      vkUnmapMemory(device, grid_mem);
+   }
+
    VkImageView src_view = make_view(device, src_image);
    VkImageView dst_view = make_view(device, dst_image);
 
@@ -239,7 +276,7 @@ main(void)
    VkSampler sampler;
    CHECK(vkCreateSampler(device, &sampler_info, NULL, &sampler));
 
-   VkDescriptorSetLayoutBinding bindings[2] = {
+   VkDescriptorSetLayoutBinding bindings[3] = {
       {
          .binding = 0,
          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
@@ -252,23 +289,30 @@ main(void)
          .descriptorCount = 1,
          .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
       },
+      {
+         .binding = 2,
+         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+         .descriptorCount = 1,
+         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+      },
    };
    VkDescriptorSetLayoutCreateInfo dsl_info = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-      .bindingCount = 2,
+      .bindingCount = 3,
       .pBindings = bindings,
    };
    VkDescriptorSetLayout dsl;
    CHECK(vkCreateDescriptorSetLayout(device, &dsl_info, NULL, &dsl));
 
-   VkDescriptorPoolSize pool_sizes[2] = {
+   VkDescriptorPoolSize pool_sizes[3] = {
       { .type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = 1 },
       { .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1 },
+      { .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1 },
    };
    VkDescriptorPoolCreateInfo pool_info = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
       .maxSets = 1,
-      .poolSizeCount = 2,
+      .poolSizeCount = 3,
       .pPoolSizes = pool_sizes,
    };
    VkDescriptorPool desc_pool;
@@ -292,7 +336,12 @@ main(void)
       .imageView = src_view,
       .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
    };
-   VkWriteDescriptorSet writes[2] = {
+   VkDescriptorBufferInfo grid_info = {
+      .buffer = grid_buf,
+      .offset = 0,
+      .range = VK_WHOLE_SIZE,
+   };
+   VkWriteDescriptorSet writes[3] = {
       {
          .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
          .dstSet = desc_set,
@@ -309,13 +358,21 @@ main(void)
          .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
          .pImageInfo = &src_info,
       },
+      {
+         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+         .dstSet = desc_set,
+         .dstBinding = 2,
+         .descriptorCount = 1,
+         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+         .pBufferInfo = &grid_info,
+      },
    };
-   vkUpdateDescriptorSets(device, 2, writes, 0, NULL);
+   vkUpdateDescriptorSets(device, 3, writes, 0, NULL);
 
    VkShaderModuleCreateInfo sm_info = {
       .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-      .codeSize = sizeof(comp_spv),
-      .pCode = comp_spv,
+      .codeSize = grid_only ? sizeof(grid_spv) : sizeof(comp_spv),
+      .pCode = grid_only ? grid_spv : comp_spv,
    };
    VkShaderModule module;
    CHECK(vkCreateShaderModule(device, &sm_info, NULL, &module));
@@ -401,10 +458,59 @@ main(void)
             bad++;
       }
    }
-   vkUnmapMemory(device, dst_mem);
-
    printf("first=%u,%u,%u,%u bad=%u/%u\n",
           first[0], first[1], first[2], first[3], bad, width * height);
+   {
+      const uint32_t coords[10][2] = {
+         {0,0}, {1,0}, {2,0}, {63,0}, {0,1}, {0,2}, {1,1}, {5,5}, {10,10}, {63,63}
+      };
+      for (unsigned i = 0; i < 10; i++) {
+         uint32_t x = coords[i][0], y = coords[i][1];
+         const uint8_t *p = map + dst_layout.offset + y * dst_layout.rowPitch + x * 4;
+         printf("dst(%u,%u)=%u,%u,%u,%u\n", x, y, p[0], p[1], p[2], p[3]);
+      }
+
+      unsigned written = 0, shown = 0;
+      for (uint32_t y = 0; y < height; y++) {
+         const uint8_t *row = map + dst_layout.offset + y * dst_layout.rowPitch;
+         for (uint32_t x = 0; x < width; x++) {
+            const uint8_t *p = row + x * 4;
+            if (p[0] == 0xa5 && p[1] == 0xa5 && p[2] == 0xa5 && p[3] == 0xa5)
+               continue;
+            written++;
+            if (shown < 20) {
+               printf("written(%u,%u)=%u,%u,%u,%u\n", x, y, p[0], p[1], p[2], p[3]);
+               shown++;
+            }
+         }
+      }
+      printf("written=%u\n", written);
+   }
+   {
+      uint32_t *gmap;
+      CHECK(vkMapMemory(device, grid_mem, 0, VK_WHOLE_SIZE, 0, (void **)&gmap));
+      unsigned touched = 0, wrong = 0, shown = 0;
+      for (uint32_t y = 0; y < height; y++) {
+         for (uint32_t x = 0; x < width; x++) {
+            uint32_t idx = x + y * width;
+            uint32_t val = gmap[idx];
+            uint32_t expect = x | (y << 8) | ((y / 8) << 16);
+            if (val != 0xdeadbeefu)
+               touched++;
+            if (val != expect) {
+               wrong++;
+               if (shown < 10) {
+                  printf("grid(%u,%u) idx=%u val=%08x expect=%08x\n",
+                         x, y, idx, val, expect);
+                  shown++;
+               }
+            }
+         }
+      }
+      printf("grid touched=%u wrong=%u/%u\n", touched, wrong, width * height);
+      vkUnmapMemory(device, grid_mem);
+   }
+   vkUnmapMemory(device, dst_mem);
    if (bad) {
       printf("FAIL\n");
       return 1;

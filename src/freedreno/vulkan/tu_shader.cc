@@ -779,8 +779,13 @@ lower_image_deref(struct tu_device *dev, nir_builder *b,
          return;
 
       nir_builder b_at = nir_builder_at(nir_before_instr(&instr->instr));
+      /* Use the non-bindless intrinsic with the binding as the image index.
+       * ir3's a4xx/a5xx image code then treats it as a bindful slot, and
+       * ir3_nir_scan_driver_consts() allocates the image-size constants that
+       * LDIB/STIB need to compute byte offsets.
+       */
       nir_rewrite_image_intrinsic(instr, nir_imm_int(&b_at, binding),
-                                  nir_image_intrinsic_type_bindless);
+                                  nir_image_intrinsic_type_default);
       return;
    }
 
@@ -3730,6 +3735,7 @@ tu_shader_cache_process_blob(IO &io, struct tu_shader *shader)
    io.bytes(shader->samp_map, sizeof(shader->samp_map));
    io.u8(shader->num_images);
    io.bytes(shader->image_map, sizeof(shader->image_map));
+   io.bytes(shader->image_format, sizeof(shader->image_format));
 
    io.variant(shader->variant);
 
@@ -4071,6 +4077,8 @@ tu_shader_create(struct tu_device *dev,
                var->data.descriptor_set;
             shader->image_map[var->data.binding + i].binding =
                var->data.binding + i;
+            shader->image_format[var->data.binding + i] =
+               var->data.image.format;
          }
          shader->num_images = MAX2(shader->num_images,
                                    var->data.binding + array_size);
