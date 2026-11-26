@@ -20,6 +20,10 @@ static const uint32_t grid_spv[] =
 #include "storage_image_grid_comp.inc"
 ;
 
+static const uint32_t load_spv[] =
+#include "storage_image_load_comp.inc"
+;
+
 static uint32_t
 find_memory_type(VkPhysicalDevice phys, uint32_t bits, VkMemoryPropertyFlags flags)
 {
@@ -122,6 +126,7 @@ int
 main(int argc, char **argv)
 {
    bool grid_only = argc > 1 && !strcmp(argv[1], "grid");
+   bool load_mode = argc > 1 && !strcmp(argv[1], "load");
 
    VkApplicationInfo app = {
       .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
@@ -226,7 +231,19 @@ main(int argc, char **argv)
    {
       uint8_t *map;
       CHECK(vkMapMemory(device, dst_mem, 0, VK_WHOLE_SIZE, 0, (void **)&map));
-      memset(map, 0xa5, dst_layout.size);
+      if (load_mode) {
+         for (uint32_t y = 0; y < height; y++) {
+            uint8_t *row = map + dst_layout.offset + y * dst_layout.rowPitch;
+            for (uint32_t x = 0; x < width; x++) {
+               row[x * 4 + 0] = x & 0xff;
+               row[x * 4 + 1] = y & 0xff;
+               row[x * 4 + 2] = 0;
+               row[x * 4 + 3] = 255;
+            }
+         }
+      } else {
+         memset(map, 0xa5, dst_layout.size);
+      }
       vkUnmapMemory(device, dst_mem);
    }
 
@@ -369,10 +386,20 @@ main(int argc, char **argv)
    };
    vkUpdateDescriptorSets(device, 3, writes, 0, NULL);
 
+   const uint32_t *spv = comp_spv;
+   size_t spv_size = sizeof(comp_spv);
+   if (grid_only) {
+      spv = grid_spv;
+      spv_size = sizeof(grid_spv);
+   } else if (load_mode) {
+      spv = load_spv;
+      spv_size = sizeof(load_spv);
+   }
+
    VkShaderModuleCreateInfo sm_info = {
       .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-      .codeSize = grid_only ? sizeof(grid_spv) : sizeof(comp_spv),
-      .pCode = grid_only ? grid_spv : comp_spv,
+      .codeSize = spv_size,
+      .pCode = spv,
    };
    VkShaderModule module;
    CHECK(vkCreateShaderModule(device, &sm_info, NULL, &module));
@@ -453,7 +480,10 @@ main(int argc, char **argv)
          const uint8_t *p = row + x * 4;
          if (x == 0 && y == 0)
             memcpy(first, p, 4);
-         if (p[0] != (x & 0xff) || p[1] != (y & 0xff) ||
+         if (grid_only)
+            continue;
+         uint8_t expect_r = load_mode ? ((x + 1) & 0xff) : (x & 0xff);
+         if (p[0] != expect_r || p[1] != (y & 0xff) ||
              p[2] != 0 || p[3] != 255)
             bad++;
       }
@@ -486,6 +516,7 @@ main(int argc, char **argv)
       }
       printf("written=%u\n", written);
    }
+   unsigned grid_wrong = 0;
    {
       uint32_t *gmap;
       CHECK(vkMapMemory(device, grid_mem, 0, VK_WHOLE_SIZE, 0, (void **)&gmap));
@@ -507,10 +538,23 @@ main(int argc, char **argv)
             }
          }
       }
-      printf("grid touched=%u wrong=%u/%u\n", touched, wrong, width * height);
+      if (grid_only)
+         printf("grid touched=%u wrong=%u/%u\n",
+                touched, wrong, width * height);
+      grid_wrong = wrong;
       vkUnmapMemory(device, grid_mem);
    }
    vkUnmapMemory(device, dst_mem);
+
+   if (grid_only) {
+      if (grid_wrong) {
+         printf("FAIL\n");
+         return 1;
+      }
+      printf("PASS: 2D compute grid\n");
+      return 0;
+   }
+
    if (bad) {
       printf("FAIL\n");
       return 1;
