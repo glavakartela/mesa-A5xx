@@ -54,8 +54,10 @@ sampler (texelFetch). `tu5_storage_image_test grid` additionally records
 ```sh
 timeout 30 ./tu5_storage_image_test
 # expected: PASS: compute sampled texture -> storage image
+timeout 30 ./tu5_storage_image_test load
+# imageLoad + imageStore: PASS
 timeout 30 ./tu5_storage_image_test grid
-# diagnostics: "grid touched=4096 wrong=0/4096"
+# diagnostics: "grid touched=4096 wrong=0/4096", PASS
 ```
 
 For chip 5 Turnip now advertises `dynamicRendering`, `timelineSemaphore`,

@@ -55,8 +55,10 @@ binding 0 — storage image (imageStore), binding 1 — combined image sampler
 ```sh
 timeout 30 ./tu5_storage_image_test
 # ожидаемо: PASS: compute sampled texture -> storage image
+timeout 30 ./tu5_storage_image_test load
+# imageLoad + imageStore: PASS
 timeout 30 ./tu5_storage_image_test grid
-# диагностика: "grid touched=4096 wrong=0/4096"
+# диагностика: "grid touched=4096 wrong=0/4096", PASS
 ```
 
 Для chip 5 Turnip теперь рекламирует `dynamicRendering`,
