@@ -33,6 +33,12 @@ if command -v glslc >/dev/null 2>&1; then
       glslc -fshader-stage=frag --target-env=vulkan1.0 -mfmt=c \
          "$f" -o "${base}_frag.inc"
    done
+   for f in *.comp; do
+      [ -f "$f" ] || continue
+      base=${f%.comp}
+      glslc -fshader-stage=comp --target-env=vulkan1.0 -mfmt=c \
+         "$f" -o "${base}_comp.inc"
+   done
 fi
 
 for src in tu5_*.c; do

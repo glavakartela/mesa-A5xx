@@ -1,0 +1,17 @@
+#version 450
+/* Storage image store + sampled texture fetch in a compute shader.
+ * This mirrors the Gamescope composite pattern: sample a combined image
+ * sampler array and write the result to a storage image.  Descriptor set 0
+ * with the Vulkan binding as the hardware slot (a5xx bindful path).
+ */
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0, rgba8) writeonly uniform image2D dst;
+layout(binding = 1) uniform sampler2D src;
+
+void main()
+{
+   ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+   vec4 v = texelFetch(src, coord, 0);
+   imageStore(dst, coord, vec4(v.r, v.g, 0.0, 1.0));
+}
