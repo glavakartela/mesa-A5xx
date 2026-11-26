@@ -30,7 +30,8 @@ for t in tu5_test tu5_ubo_test tu5_array_test \
          tu5_stencil_test tu5_mrt_test tu5_uvvb_test \
          tu5_texcopy_test tu5_ubo_gfx_test tu5_idx_test \
          tu5_wsi_test tu5_wl_wsi_test tu5_bufops_test \
-         tu5_clearcopy_test tu5_storage_image_test; do
+         tu5_clearcopy_test tu5_storage_image_test \
+         tu5_dynrender_test; do
   timeout 30 ./$t >/tmp/o 2>&1
   echo "$t rc=$? $(tail -1 /tmp/o)"
 done
@@ -60,7 +61,8 @@ timeout 30 ./tu5_storage_image_test grid
 For chip 5 Turnip now advertises `dynamicRendering`, `timelineSemaphore`,
 `scalarBlockLayout`, `samplerYcbcrConversion`, `nullDescriptor` and
 `presentId`/`presentWait`, the minimum Gamescope 3.17 requests at
-`vkCreateDevice`.
+`vkCreateDevice`. `tu5_dynrender_test` exercises
+`vkCmdBeginRendering`/`vkCmdEndRendering` itself (triangle + loadOp=CLEAR).
 
 ## WSI / vkcube
 
