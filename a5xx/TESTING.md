@@ -56,10 +56,23 @@ binding 0 — storage image (imageStore), binding 1 — combined image sampler
 timeout 30 ./tu5_storage_image_test
 # ожидаемо: PASS: compute sampled texture -> storage image
 timeout 30 ./tu5_storage_image_test load
-# imageLoad + imageStore: PASS
+# известное ограничение: imageLoad в read-write образ пока не пишет
 timeout 30 ./tu5_storage_image_test grid
 # диагностика: "grid touched=4096 wrong=0/4096", PASS
 ```
+
+Gamescope (проверено в сеансе KWin):
+
+```sh
+XDG_RUNTIME_DIR=/run/user/1001 \
+  gamescope --backend=wayland --expose-wayland -W 640 -H 480 \
+  -- vkcube --wsi wayland
+```
+
+Ожидаемо: окно Gamescope с кубом; в логе нет ошибок
+`vkCreateDevice`/`vkCreateComputePipelines`. `vkCreateDevice` требует
+`swapchainMaintenance1` (Gamescope WSI форсирует его) и
+`presentId`/`presentWait`.
 
 Для chip 5 Turnip теперь рекламирует `dynamicRendering`,
 `timelineSemaphore`, `scalarBlockLayout`, `samplerYcbcrConversion`,

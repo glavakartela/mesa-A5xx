@@ -13,9 +13,17 @@ Gamescope 3.17 падал на `vkCreateDevice` с
 Теперь для chip 5 включены ровно те, что нужны Gamescope (и реализуемы):
 `dynamicRendering`, `timelineSemaphore`, `scalarBlockLayout`,
 `samplerYcbcrConversion`, `nullDescriptor`,
-`shaderStorageImageWriteWithoutFormat`, `presentId`, `presentWait`.
+`shaderStorageImageWriteWithoutFormat`, `presentId`/`presentWait`,
+`swapchainMaintenance1` и `presentId2`/`presentWait2`.
+`VK_EXT_swapchain_maintenance1` обязателен: Gamescope WSI форсирует его
+и патчит `VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT` в true.
 `vkCmdBeginRendering`/`vkCmdEndRendering` для chip 5 обходят GMEM/LRZ и
 работают как sysmem render pass.
+
+Проверено на A509: `gamescope --backend=wayland --expose-wayland` внутри
+KWin, внутри него `vkcube --wsi wayland` — куб LUNAR рисуется и
+композитится на экран. Headless-бэкенд также стартует и создаёт
+swapchain клиента.
 
 Compute-путь получил bindful storage images: descriptor set 0, слот =
 Vulkan binding; `imageLoad` идёт через TEX-блок (ISAM/LDIB), `imageStore`
@@ -25,7 +33,12 @@ bytes-per-pixel, pitch и layer size. Тест: `tu5_storage_image_test`
 
 Ограничения: сэмплерные массивы эмитятся только для элемента 0
 (Gamescope для одного слоя использует `s_samplers[0]`), динамические
-image-массивы не поддержаны.
+image-массивы не поддержаны. `tu5_storage_image_test load` (явный
+`imageLoad` в read-write образ) пока не проходит; Gamescope пишет
+storage images без чтения, поэтому на композитор это не влияет.
+Debug-команда `gamescopectl screenshot` в headless-режиме роняет
+Gamescope (backtrace в `tu_AllocateMemory`); обычный рендер и
+презентация работают.
 
 Сделано: CP_SET_RENDER_MODE(BYPASS), SP/HLSQ program state, VFD, VPC,
 RB MRT, sample mask, UCHE invalidate между процессами, swap как в fd5,

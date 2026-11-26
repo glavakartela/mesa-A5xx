@@ -55,10 +55,23 @@ sampler (texelFetch). `tu5_storage_image_test grid` additionally records
 timeout 30 ./tu5_storage_image_test
 # expected: PASS: compute sampled texture -> storage image
 timeout 30 ./tu5_storage_image_test load
-# imageLoad + imageStore: PASS
+# known limitation: imageLoad into a read-write image is not writing yet
 timeout 30 ./tu5_storage_image_test grid
 # diagnostics: "grid touched=4096 wrong=0/4096", PASS
 ```
+
+Gamescope (verified in a KWin session):
+
+```sh
+XDG_RUNTIME_DIR=/run/user/1001 \
+  gamescope --backend=wayland --expose-wayland -W 640 -H 480 \
+  -- vkcube --wsi wayland
+```
+
+Expected: a Gamescope window with the cube, no `vkCreateDevice` or
+`vkCreateComputePipelines` errors.  Device creation requires
+`swapchainMaintenance1` (the Gamescope WSI layer forces it) plus
+`presentId`/`presentWait`.
 
 For chip 5 Turnip now advertises `dynamicRendering`, `timelineSemaphore`,
 `scalarBlockLayout`, `samplerYcbcrConversion`, `nullDescriptor` and
