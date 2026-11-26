@@ -33,7 +33,9 @@ via ISAM/LDIB) and sampled textures; `vkCmdBeginRendering`/
 
 Verified: `gamescope --backend=wayland --expose-wayland` nested in KWin
 with `vkcube --wsi wayland` inside it shows the LUNAR cube.  The
-headless backend also creates the client swapchain.
+headless backend also creates the client swapchain.  `glxgears` through
+Xwayland inside Gamescope runs at 60 FPS (`GL_RENDERER = FD509`), so the
+X11/GL path used by Wine is functional too.
 
 Limits: sampler arrays use element 0 only; `imageLoad` into a read-write
 storage image does not write yet; `gamescopectl screenshot` in the

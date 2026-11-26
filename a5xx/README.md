@@ -31,7 +31,9 @@ Gamescope 3.17 запускается и композитит на a5xx. Для 
 
 Проверено: `gamescope --backend=wayland --expose-wayland` внутри KWin,
 внутри него `vkcube --wsi wayland` — куб LUNAR виден на экране.
-Headless-бэкенд также создаёт swapchain клиента.
+Headless-бэкенд также создаёт swapchain клиента. `glxgears` через
+Xwayland внутри Gamescope работает на 60 FPS (`GL_RENDERER = FD509`),
+то есть X11/GL-путь для Wine тоже живой.
 
 Ограничения: сэмплерные массивы — только элемент 0; `imageLoad` в
 read-write storage image пока не пишет; `gamescopectl screenshot` в
