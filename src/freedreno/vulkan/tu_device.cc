@@ -496,6 +496,13 @@ tu_get_features(struct tu_physical_device *pdevice,
       /* Gamescope enables both for its Wayland/X11 swapchain paths. */
       features->presentId = true;
       features->presentWait = true;
+      /* The Gamescope WSI layer force-enables
+       * VK_EXT_swapchain_maintenance1 and the corresponding feature on
+       * every device it wraps, so it must be advertised for chip 5.
+       */
+      features->swapchainMaintenance1 = true;
+      features->presentId2 = true;
+      features->presentWait2 = true;
 #endif
       return;
    }
